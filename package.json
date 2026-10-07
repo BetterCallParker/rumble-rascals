@@ -1,0 +1,26 @@
+{
+  "name": "rumble-rascals",
+  "version": "1.0.0",
+  "description": "Comic-book party brawler: up to 8 players, Xbox controllers, server/client multiplayer in three.js",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BetterCallParker/rumble-rascals.git"
+  },
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/BetterCallParker/rumble-rascals/issues"
+  },
+  "homepage": "https://github.com/BetterCallParker/rumble-rascals#readme",
+  "dependencies": {
+    "three": "^0.186.1",
+    "ws": "^8.22.0"
+  },
+  "type": "module"
+}

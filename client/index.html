@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rumble Rascals</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three/build/three.module.js",
+        "three/addons/": "/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <canvas id="game"></canvas>
+    <div id="labels"></div>
+    <div id="fx"></div>
+    <div id="flash"></div>
+
+    <div id="hud" class="hidden">
+      <div id="topbar">
+        <div id="roomtag" class="panel small"></div>
+        <div id="phase" class="panel"></div>
+        <div id="net" class="panel small"></div>
+      </div>
+      <div id="announce"></div>
+      <div id="lobby" class="panel hidden"></div>
+      <div id="joinbar"></div>
+      <div id="cards"></div>
+      <div id="help" class="hidden"></div>
+    </div>
+
+    <div id="title">
+      <div class="title-rays"></div>
+      <div class="title-card">
+        <h1 class="logo"><span class="l1">RUMBLE</span><span class="l2">RASCALS!</span></h1>
+        <p class="tagline">The comic-book brawl for up to 8 rascals!</p>
+        <div class="form">
+          <label>NAME <input id="name" maxlength="14" placeholder="Your rascal name" autocomplete="off" /></label>
+          <label>ROOM <input id="room" maxlength="8" placeholder="MAIN" autocomplete="off" /></label>
+          <button id="play">LET'S RUMBLE!</button>
+        </div>
+        <div id="titlepads" class="padinfo">Plug in an Xbox controller &amp; press <b>A</b>, or hit <b>ENTER</b></div>
+        <div class="title-controls">
+          <div><b>LT / RT</b> left &amp; right hand grab (both = lift overhead!)</div>
+          <div><b>X</b> punch / swing (hold to charge) &nbsp; <b>Y</b> kick &nbsp; <b>A</b> jump &nbsp; <b>B</b> dodge &nbsp; <b>RB</b> block</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
