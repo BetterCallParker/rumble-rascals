@@ -1,19 +1,22 @@
-// Rumble Rascals web client.
+// Rumble Rascals web client: networking + prediction, one third-person camera per local
+// player (split-screen for couch co-op), lobby, music, effects and HUD.
 import * as THREE from 'three';
-import { DT, BTN, ST, PHASE, COLORS, MAX_PLAYERS } from '/shared/constants.js';
-import { ARENA, ballPosition } from '/shared/arena.js';
+import { DT, BTN, ST, PHASE, MAX_PLAYERS, SPRINT, quantizeAxis } from '/shared/constants.js';
+import { LEVELS, levelBoxesAt } from '/shared/levels.js';
 import { ITEMS } from '/shared/items.js';
+import { settingValue } from '/shared/settings.js';
 import { Input, PAD } from './input.js';
 import { Net } from './net.js';
 import { Rascal } from './character.js';
-import { buildItem } from './props.js';
-import { buildArena } from './arena.js';
+import { buildItem, buildBullet } from './props.js';
+import { buildLevel } from './levels.js';
 import { ComicPost } from './post.js';
 import { FX } from './fx.js';
 import { Hud } from './hud.js';
-import { Sfx } from './audio.js';
+import { Sfx, Music } from './audio.js';
 import { Predictor } from './predict.js';
-import { skyTexture } from './toon.js';
+import { PlayerCam, layoutViewports } from './cameras.js';
+import { Lobby, renderPortraits } from './lobby.js';
 
 // ------------------------------------------------------------------ renderer / scene
 const canvas = document.getElementById('game');
@@ -22,43 +25,67 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPrefer
 renderer.setPixelRatio(QUALITY === 'low' ? Math.min(window.devicePixelRatio || 1, 1) * 0.75 : Math.min(window.devicePixelRatio || 1, 1.75));
 renderer.shadowMap.enabled = QUALITY !== 'low';
 renderer.shadowMap.type = THREE.PCFShadowMap;
-renderer.setClearColor(0x7cc4ff, 1);
 
 const scene = new THREE.Scene();
-scene.background = skyTexture();
-scene.fog = new THREE.Fog(0xbcd8ff, 110, 300);
-const camera = new THREE.PerspectiveCamera(36, 1, 0.5, 600);
-camera.position.set(0, 22, 26);
-camera.lookAt(0, 0, 0);
-
 const hemi = new THREE.HemisphereLight(0xdcefff, 0x8a6f9a, 1.35);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff0d0, 2.6);
-sun.position.set(14, 30, 16);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -28;
-sun.shadow.camera.right = 28;
-sun.shadow.camera.top = 22;
-sun.shadow.camera.bottom = -22;
 sun.shadow.camera.near = 5;
-sun.shadow.camera.far = 80;
+sun.shadow.camera.far = 120;
 sun.shadow.bias = -0.0006;
 sun.shadow.normalBias = 0.03;
-scene.add(sun);
-scene.add(sun.target);
+scene.add(sun, sun.target);
+let shadowHalf = 0;
 
-const arena = buildArena(scene);
 const post = new ComicPost(renderer);
-const fx = new FX(scene, camera);
+const overviewCam = new PlayerCam();
+overviewCam.zoom = 1;
+overviewCam.pitch = 0.62;
+overviewCam.idle = 1e9;
+const fx = new FX(scene, overviewCam.camera);
+post.onView = (cam) => fx.faceCamera(cam);
 const hud = new Hud();
 const sfx = new Sfx();
+const music = new Music(sfx);
 const input = new Input();
+const lobby = new Lobby({ send: (m) => net.send(m), sfx: (n) => sfx.play(n) });
+
+// ------------------------------------------------------------------ level
+let level = null;
+let levelIndex = -1;
+let levelCenter = new THREE.Vector3();
+function setLevel(i) {
+  if (i === levelIndex && level) return;
+  if (level) level.dispose();
+  levelIndex = i;
+  level = buildLevel(scene, i);
+  const env = level.env;
+  scene.background = env.sky;
+  scene.fog = new THREE.Fog(env.fog, env.fogNear, env.fogFar);
+  renderer.setClearColor(env.fog, 1);
+  hemi.color.setHex(env.hemi[0]);
+  hemi.groundColor.setHex(env.hemi[1]);
+  hemi.intensity = env.hemi[2];
+  sun.color.setHex(env.sun[0]);
+  sun.intensity = env.sun[1];
+  const sp = level.lv.spawns;
+  levelCenter.set(0, 0, 0);
+  for (const s of sp) levelCenter.add(new THREE.Vector3(s[0], s[1], s[2]));
+  levelCenter.divideScalar(Math.max(1, sp.length));
+  overviewCam.ready = false;
+  for (const L of local.values()) L.cam.ready = false;
+  if (started) music.play(level.lv.music);
+}
 
 // ------------------------------------------------------------------ game state
-const roster = new Map(); // id -> {id,name,color,dummy,ready,wins,kos,client}
+const roster = new Map(); // id -> {id,name,color,dummy,ready,wins,kos,client,hat,face,char}
+const meta = { lv: 0, host: -1, settings: {} };
 const views = new Map(); // id -> Rascal
-const propViews = new Map(); // id -> {group, inner, kind, spin, axis}
+const propViews = new Map(); // id -> {group, inner, kind, ...}
+const bulletViews = new Map(); // id -> mesh
+const puddleMeshes = [];
 const joinedSlots = new Map(); // slot -> playerId
 const pendingJoins = new Set(); // slots waiting for server
 const local = new Map(); // playerId -> local player info
@@ -71,8 +98,13 @@ let inputAcc = 0;
 let freezeT = 0;
 let speedT = 0;
 let impactT = 0;
+let slowT = 0; // dramatic slow-mo on the final knockout
+let slowLag = 0;
 let lastSample = null;
+let lastPhase = -1;
 let full = false;
+let viewList = []; // [{ L, cam, rect }]
+let camResetT = 0;
 
 const net = new Net({
   onWelcome(m) {
@@ -86,30 +118,45 @@ const net = new Net({
     for (const slot of pendingJoins) net.send({ t: 'join', slot, name: joinedName(slot) });
   },
   onRoster(m) {
+    meta.lv = m.lv;
+    meta.host = m.host;
+    meta.settings = m.settings || {};
+    hud.roundsToWin = settingValue(meta.settings, 'rounds') || 3;
     const ids = new Set();
     for (const r of m.players) {
       ids.add(r.id);
       roster.set(r.id, r);
-      if (!views.has(r.id)) {
-        const v = new Rascal(r.dummy ? 0 : r.color, r.dummy);
+      const key = `${r.dummy ? 'd' : r.color}:${r.char || 0}`;
+      let v = views.get(r.id);
+      if (v && v.key !== key) {
+        scene.remove(v.root);
+        v.dispose();
+        views.delete(r.id);
+        v = null;
+        // re-parent any props this rascal was holding
+        for (const pv of propViews.values()) if (pv.group.parent && pv.group.parent !== scene) scene.add(pv.group);
+      }
+      if (!v) {
+        v = new Rascal(r.dummy ? 0 : r.color, r.dummy, r.char || 0);
+        v.key = key;
         scene.add(v.root);
         views.set(r.id, v);
       }
+      v.setCosmetics(r.hat || 0, r.face || 0);
     }
     for (const id of [...roster.keys()]) {
-      if (!ids.has(id)) {
-        roster.delete(id);
-        const v = views.get(id);
-        if (v) {
-          scene.remove(v.root);
-          v.dispose();
-          views.delete(id);
-        }
-        if (local.has(id)) {
-          const L = local.get(id);
-          joinedSlots.delete(L.slot);
-          local.delete(id);
-        }
+      if (ids.has(id)) continue;
+      roster.delete(id);
+      const v = views.get(id);
+      if (v) {
+        for (const pv of propViews.values()) if (pv.group.parent && pv.group.parent !== scene) scene.add(pv.group);
+        scene.remove(v.root);
+        v.dispose();
+        views.delete(id);
+      }
+      if (local.has(id)) {
+        joinedSlots.delete(local.get(id).slot);
+        local.delete(id);
       }
     }
     full = [...roster.values()].filter((r) => !r.dummy).length >= MAX_PLAYERS;
@@ -122,22 +169,29 @@ const net = new Net({
     while (used.has(n)) n++;
     const raw = input.read(m.slot);
     local.set(m.id, {
-      id: m.id, slot: m.slot, n, label: 'P' + n, pred: new Predictor(m.id),
-      suppress: raw.b, prevB: raw.b, lastInput: raw, predAct: null,
-      renderPos: null, err: new THREE.Vector3(), wasPred: false,
+      id: m.id, slot: m.slot, n, label: 'P' + n, pred: new Predictor(m.id), cam: new PlayerCam(),
+      suppress: raw.b, prevB: raw.b, lastInput: raw, predAct: null, frozen: true,
+      renderPos: null, err: new THREE.Vector3(), wasPred: false, server: null,
+      focus: new THREE.Vector3(), deadT: 0, specId: -1,
     });
+    lobby.state(m.id).mode = 'pick';
     sfx.play('join');
-    hud.word(`P${n} JOINED!`, null, { sx: window.innerWidth / 2, sy: window.innerHeight * 0.62, size: 40 });
   },
-  onFull(m) {
-    pendingJoins.delete(m.slot);
+  onFull() {
+    pendingJoins.clear();
     hud.word('ROOM FULL!', null, { sx: window.innerWidth / 2, sy: window.innerHeight / 2, size: 54 });
   },
   onSnapshot(s) {
     for (const [id, L] of local) {
       const sp = s.players.find((p) => p.id === id);
-      L.pred.reconcile(sp, s);
+      const r = roster.get(id);
+      L.pred.reconcile(sp, s, r ? r.char || 0 : 0);
       L.server = sp;
+    }
+    if (s.ph !== lastPhase) {
+      if (s.ph === PHASE.LOBBY) for (const id of local.keys()) lobby.state(id).mode = 'pick';
+      if (s.ph === PHASE.COUNTDOWN) camResetT = 0.3; // once the respawned rascals are on screen
+      lastPhase = s.ph;
     }
   },
   onClose() {
@@ -156,6 +210,14 @@ function requestJoin(slot) {
   if (welcomed) net.send({ t: 'join', slot, name: joinedName(slot) });
 }
 
+const sortedLocals = () => [...local.values()].sort((a, b) => a.n - b.n);
+const latestPhase = () => {
+  const s = net.latest();
+  return s ? s.ph : PHASE.LOBBY;
+};
+// is this local player looking at the lobby screen (not playing)?
+const inMenu = (L) => latestPhase() === PHASE.LOBBY && !lobby.isPracticing(L.id);
+
 // ------------------------------------------------------------------ title screen
 const titleEl = document.getElementById('title');
 const nameIn = document.getElementById('name');
@@ -169,6 +231,7 @@ function startGame(autoSlot) {
   if (started) return;
   started = true;
   sfx.unlock();
+  music.play(level ? level.lv.music : 0);
   playerName = nameIn.value.trim().slice(0, 14);
   try {
     localStorage.setItem('rr_name', playerName);
@@ -179,7 +242,7 @@ function startGame(autoSlot) {
   if (autoSlot) pendingJoins.add(autoSlot);
   net.connect(room, playerName);
 }
-document.getElementById('play').addEventListener('click', () => startGame(null));
+document.getElementById('play').addEventListener('click', () => startGame('kb'));
 for (const inp of [nameIn, roomIn]) {
   inp.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -188,10 +251,22 @@ for (const inp of [nameIn, roomIn]) {
     }
   });
 }
-input.onActivity(() => sfx.unlock());
+input.onActivity(() => {
+  sfx.unlock();
+  if (started) music.ensure();
+});
 window.addEventListener('pointerdown', () => sfx.unlock());
 
-// ------------------------------------------------------------------ menu-ish input (join, help)
+// ------------------------------------------------------------------ menu-ish input (join, help, lobby)
+function lobbyCtx() {
+  const hostR = [...roster.values()].find((r) => r.client === meta.host && !r.dummy);
+  const locals = sortedLocals();
+  return {
+    roster, settings: meta.settings, isHost: meta.host === net.cid, hostName: hostR ? hostR.name : '',
+    hostClient: meta.host, localSlots: local, primaryId: locals.length ? locals[0].id : null, level: meta.lv, room: roomCode,
+  };
+}
+
 function handleMeta() {
   const pads = input.pads();
   if (!started) {
@@ -211,22 +286,35 @@ function handleMeta() {
   }
   if (input.keyJustPressed('KeyH') || input.keyJustPressed('F1')) hud.toggleHelp();
   if (input.keyJustPressed('Escape')) hud.toggleHelp(false);
+  if (input.keyJustPressed('KeyM')) {
+    music.setMuted(!music.muted);
+    hud.word(music.muted ? 'MUSIC OFF' : 'MUSIC ON!', null, { sx: window.innerWidth / 2, sy: window.innerHeight * 0.2, size: 34, plain: true, colors: ['#ffffff'] });
+  }
+  const phase = latestPhase();
+  const ctx = lobbyCtx();
+  let practicing = false;
+  for (const L of local.values()) {
+    const m = input.menu(L.slot);
+    if (phase === PHASE.LOBBY) {
+      lobby.handle(L.id, m, ctx);
+      if (lobby.isPracticing(L.id)) practicing = true;
+    } else if (m.view) hud.toggleHelp();
+  }
   for (const gp of pads) {
     const slot = 'gp:' + gp.index;
-    if (input.padJustPressed(gp.index, PAD.VIEW)) hud.toggleHelp();
     if (!joinedSlots.has(slot) && (input.padJustPressed(gp.index, PAD.A) || input.padJustPressed(gp.index, PAD.MENU))) requestJoin(slot);
   }
   if (!joinedSlots.has('kb') && input.keyJustPressed('Enter')) requestJoin('kb');
 
+  const overlay = phase === PHASE.LOBBY && lobby.wantsOverlay([...local.keys()]);
   const prompts = [];
-  if (!full) {
-    for (const gp of pads) {
-      const slot = 'gp:' + gp.index;
-      if (!joinedSlots.has(slot)) prompts.push(`Controller ${gp.index + 1}: press *A* to join!`);
+  if (!overlay) {
+    if (practicing) prompts.push('Practicing! Press *VIEW / ENTER* to go back to the lobby');
+    if (!full) {
+      for (const gp of pads) if (!joinedSlots.has('gp:' + gp.index)) prompts.push(`Controller ${gp.index + 1}: press *A* to join!`);
+      if (!joinedSlots.has('kb')) prompts.push('Keyboard: press *ENTER* to join!');
     }
-    if (!joinedSlots.has('kb')) prompts.push('Keyboard: press *ENTER* to join!');
   }
-  if (!pads.length && joinedSlots.size === 0) prompts.push('Plug in an Xbox controller *+* press A');
   hud.updateJoin(prompts);
 }
 
@@ -235,19 +323,25 @@ function sampleInputs() {
   seq++;
   const rows = [];
   const latest = net.latest();
-  for (const [slot, id] of joinedSlots) {
-    const L = local.get(id);
-    if (!L) continue;
-    const inp = input.read(slot);
+  for (const L of local.values()) {
+    const raw = input.read(L.slot);
+    const frozen = inMenu(L);
+    let b = frozen ? 0 : raw.b;
+    if (L.frozen && !frozen) L.suppress = raw.b; // ignore buttons still held from the menu
+    L.frozen = frozen;
     if (L.suppress) {
-      L.suppress &= inp.b;
-      inp.b &= ~L.suppress;
+      L.suppress &= b;
+      b &= ~L.suppress;
     }
-    const pressed = inp.b & ~L.prevB;
-    L.prevB = inp.b;
-    L.lastInput = inp;
-    rows.push([id, seq, inp.mx, inp.mz, inp.b]);
-    L.pred.addInput({ seq, mx: inp.mx, mz: inp.mz, b: inp.b });
+    // stick is camera-relative: push up = run away from the camera
+    const [wx, wz] = frozen ? [0, 0] : L.cam.toWorld(raw.mx, raw.mz);
+    const mx = quantizeAxis(wx), mz = quantizeAxis(wz);
+    const ay = Math.round(L.cam.aimYaw() * 100) / 100;
+    const pressed = b & ~L.prevB;
+    L.prevB = b;
+    L.lastInput = { mx, mz, b };
+    rows.push([L.id, seq, mx, mz, b, ay]);
+    L.pred.addInput({ seq, mx, mz, b });
     if (pressed & (BTN.ATTACK | BTN.KICK)) predictAction(L, pressed, latest);
   }
   if (rows.length) net.send({ t: 'in', d: rows });
@@ -257,25 +351,23 @@ function sampleInputs() {
 function predictAction(L, pressed, snap) {
   const sp = L.server;
   if (!sp || !snap || !sp.pr || (sp.s !== ST.FREE && sp.s !== ST.BLOCK)) return;
-  if (sp.gm === 3) return;
+  if (sp.gm === 3 || !sp.og) return;
+  if ((sp.sp | 0) >= SPRINT.TICKS) return; // sprint attacks (spear / slide) come from the server
   let item = '';
   let kind;
   let mirror = 0;
   const pr = sp.h >= 0 ? snap.props.find((p) => p.id === sp.h) : null;
   const def = pr ? ITEMS[pr.k] : null;
+  if (def && def.type !== 'weapon') return; // guns, throwables and heavies are server-driven
   if (pressed & BTN.ATTACK) {
     if (sp.g >= 0) return; // throws / pummels come from the server
-    if (def && def.type === 'heavy') return;
-    if (def && def.type === 'weapon') {
+    if (def) {
       kind = def.swing.style === 'slam' ? 'slam' : 'swing';
       item = pr.k;
       mirror = sp.hh === 1 ? 1 : 0;
     } else kind = 'jab1';
-  } else {
-    if (def && def.type === 'heavy') return;
-    kind = sp.og ? 'kick' : 'dk';
-  }
-  const d = item ? ITEMS[item].swing : { jab1: { wind: 3, active: 4, rec: 9 }, kick: { wind: 6, active: 5, rec: 14 }, dk: { wind: 4, active: 46, rec: 0 } }[kind];
+  } else kind = 'kick';
+  const d = item ? ITEMS[item].swing : { jab1: { wind: 3, active: 4, rec: 9 }, kick: { wind: 6, active: 5, rec: 14 } }[kind];
   L.predAct = { k: kind, seq, t0: performance.now(), w: d.wind, a: d.active, r: d.rec, item, mirror };
 }
 
@@ -340,63 +432,103 @@ function interpolate(t) {
     }
     props.set(b.id, s);
   }
-  return { states, props, snap: B };
+  // bullets: lerp between snapshots, new ones appear at their first known spot
+  const bullets = [];
+  const ba = new Map((A.bl || []).map((x) => [x[0], x]));
+  const ahead = Math.min(0.1, Math.max(0, t - B.time));
+  for (const b of B.bl || []) {
+    const a = ba.get(b[0]);
+    if (a && A !== B) bullets.push([b[0], b[1], lerp(a[2], b[2], alpha), lerp(a[3], b[3], alpha), lerp(a[4], b[4], alpha), b[5], b[6], b[7]]);
+    else bullets.push([b[0], b[1], b[2] + b[5] * ahead, b[3] + b[6] * ahead, b[4] + b[7] * ahead, b[5], b[6], b[7]]);
+  }
+  return { states, props, bullets, snap: B, time: lerp(A.time, B.time, alpha) + (extra > 0 ? Math.min(extra, 0.1) : 0) };
 }
 
 // ------------------------------------------------------------------ events -> effects
 const tmp = new THREE.Vector3();
 const tmp2 = new THREE.Vector3();
-const HIT_COLORS = { punch: 0xffe14d, kick: 0xff8a00, weapon: 0x2fd4ff, throw: 0xef2f2a, ball: 0xffffff, body: 0xffe14d, shock: 0xffffff, prop: 0xffe14d, explode: 0xff8a00 };
-const SFX_COLORS = { wood: 0xff9420, metal: 0x2fd4ff, pan: 0xffffff, slap: 0xff6fb5, rubber: 0x5ccf3a };
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+const HIT_COLORS = { punch: 0xffe14d, kick: 0xff8a00, weapon: 0x2fd4ff, throw: 0xef2f2a, ball: 0xffffff, body: 0xffe14d, shock: 0xffffff, prop: 0xffe14d, explode: 0xff8a00, bullet: 0xffe14d, spear: 0xef2f2a, slide: 0xff8a00, pound: 0xffffff, super: 0x9b5cf0, hazard: 0xffffff };
+const SFX_COLORS = { wood: 0xff9420, metal: 0x2fd4ff, pan: 0xffffff, slap: 0xff6fb5, rubber: 0x5ccf3a, squeak: 0xffe14d, guitar: 0xef2f2a };
 const PROP_COLORS = {
   bat: [0xe8322c, 0x20161a, 0xffffff], hammer: [0x6d6a80, 0xc28a4a], pan: [0x2b2b33, 0x505060], fish: [0x4fb3d9, 0xd9f4ff],
   sign: [0xd81e1e, 0x9a98ab], wrench: [0xa9b0c4, 0xe8322c], crate: [0xc98b45, 0x8a5524], barrel: [0xe8322c, 0x5a5a68], tire: [0x26232e],
+  guitar: [0xef2f2a, 0xffd21f, 0x3d2a1a], chair: [0x6d6a80, 0x2b2b33], plank: [0xc98b45], pie: [0xffe8c0, 0xff6fb5], melon: [0x3fa535, 0xef2f2a],
+  vase: [0x2fd4ff, 0xffffff], tv: [0x3d3a4a, 0x9ab8e8], snowman: [0xffffff, 0xff8a00], present: [0xef2f2a, 0xffd21f],
 };
+const GUN_SFX = { poppistol: 'pop', blunderbuss: 'shotgun', raygun: 'zap', rocket: 'rocket', flamethrower: 'flame', acidgun: 'acid' };
+const GUN_FLASH = { poppistol: 0xffe14d, blunderbuss: 0xff8a00, raygun: 0x5cff8a, rocket: 0xff8a00, flamethrower: 0xff4a1a, acidgun: 0x8aff4a };
 
-function isLocal(id) {
-  return local.has(id);
-}
+const isLocal = (id) => local.has(id);
 function rumble(id, strong, weak, ms) {
   const L = local.get(id);
   if (L) input.rumble(L.slot, strong, weak, ms);
 }
 function playerPos(id, out) {
   const v = views.get(id);
-  if (v) return out.copy(v.root.position);
-  return null;
+  return v ? out.copy(v.root.position) : null;
 }
-function screenOf(pos) {
-  tmp2.copy(pos).project(camera);
-  return [tmp2.x * 0.5 + 0.5, tmp2.y * 0.5 + 0.5];
+function viewIndexOf(id) {
+  return viewList.findIndex((v) => v.L && v.L.id === id);
 }
+// camera shake for every view near the action (always for the players involved)
+function shake(pos, amount, ids = []) {
+  for (const v of viewList) {
+    let k = amount * Math.max(0, 1 - v.cam.target.distanceTo(pos) / 26);
+    if (v.L && ids.includes(v.L.id)) k = Math.max(k, amount);
+    if (k > 0.01) v.cam.addTrauma(k);
+  }
+}
+function punchCams(pos, k) {
+  for (const v of viewList) {
+    const d = v.cam.target.distanceTo(pos);
+    if (d < 18) v.cam.punch(pos, k * (1 - d / 18));
+  }
+}
+// speed lines centered on the action in the nearest viewport + a tiny global freeze
 function bigMoment(pos, power, impact = 0) {
-  const [sx, sy] = screenOf(pos);
-  post.uniforms.uSpeedCenter.value.set(sx, sy);
+  let best = null, bd = 1e9;
+  for (const v of viewList) {
+    const d = v.cam.target.distanceTo(pos);
+    if (d < bd) { bd = d; best = v; }
+  }
+  if (!best || bd > 30) return;
+  tmp2.copy(pos).project(best.cam.camera);
+  const r = best.rect;
+  post.uniforms.uSpeedCenter.value.set(r.x + (tmp2.x * 0.5 + 0.5) * r.w, r.y + (tmp2.y * 0.5 + 0.5) * r.h);
   speedT = Math.max(speedT, Math.min(0.45, 0.12 + power * 0.012));
   if (impact) impactT = Math.max(impactT, impact);
   freezeT = Math.max(freezeT, Math.min(0.11, power * 0.0035));
+}
+function above(id, dy) {
+  const p = playerPos(id, new THREE.Vector3());
+  return p ? p.add(new THREE.Vector3(0, dy, 0)) : null;
 }
 
 function onEvent(e) {
   switch (e.e) {
     case 'hit': {
-      const pos = tmp.set(e.x, e.y, e.z).clone();
+      const pos = V(e.x, e.y, e.z);
       const p = e.p || 5;
       const v = views.get(e.v);
       if (v) v.hitFlash(p);
-      const color = e.k === 'weapon' || e.k === 'throw' ? SFX_COLORS[e.sfx] || HIT_COLORS[e.k] : HIT_COLORS[e.k] || 0xffe14d;
       if (e.k === 'explode') {
-        cam.addTrauma(0.25);
+        shake(pos, 0.25, [e.v]);
         break;
       }
+      const color = e.k === 'weapon' || e.k === 'throw' ? SFX_COLORS[e.sfx] || HIT_COLORS[e.k] : HIT_COLORS[e.k] || 0xffe14d;
       fx.impact(pos.x, pos.y, pos.z, e.pm ? p * 0.6 : p, color, e.dx || e.dz ? [e.dx, e.dz] : null);
       if (e.w) hud.word(e.w, pos, { size: Math.round(30 + Math.min(62, p * 2.3)), spikes: p > 16 ? 16 : 11 });
-      cam.addTrauma(Math.min(0.85, 0.1 + p * 0.028));
-      cam.punch(pos, Math.min(1, p / 25));
+      shake(pos, Math.min(0.85, 0.1 + p * 0.028), [e.v, e.a]);
+      punchCams(pos, Math.min(1, p / 25));
       if (p > 15 && !e.pm) bigMoment(pos, p, (e.c || 0) > 0.85 || p > 32 ? 0.06 : 0);
       if (p > 13) {
         const vp = playerPos(e.v, tmp2);
         if (vp) fx.dust(vp.x, vp.y, vp.z, 5, 1.1, 0.6);
+      }
+      if (e.cb >= 3) {
+        const ap = above(e.a, 3.1);
+        if (ap) hud.word(`${e.cb} HIT COMBO!`, ap, { size: 26 + Math.min(20, e.cb * 2), plain: e.cb < 5, colors: ['#ffd21f', '#9b5cf0'], only: isLocal(e.a) ? viewIndexOf(e.a) : -1 });
       }
       const snd = e.k === 'punch' ? 'punch' : e.k === 'kick' ? 'kick' : e.k === 'ball' ? 'ball' : e.k === 'body' ? 'bounce' : e.k === 'shock' ? 'land' : e.k === 'prop' ? e.sfx || 'clunk' : e.sfx || 'punch';
       sfx.play(snd, p);
@@ -423,112 +555,281 @@ function onEvent(e) {
     case 'bounce': {
       fx.dust(e.x, e.y, e.z, 7, 1.2, 0.65);
       sfx.play('bounce', e.s);
-      cam.addTrauma(Math.min(0.4, e.s * 0.02));
-      if (e.s > 11) hud.word(Math.random() < 0.5 ? 'THUD!' : 'BONK!', tmp.set(e.x, e.y + 0.5, e.z), { size: 30 });
+      shake(V(e.x, e.y, e.z), Math.min(0.4, e.s * 0.02), [e.id]);
+      if (e.s > 11) hud.word(Math.random() < 0.5 ? 'THUD!' : 'BONK!', V(e.x, e.y + 0.5, e.z), { size: 30 });
       break;
     }
+    case 'boing':
+      fx.dust(e.x, e.y, e.z, 6, 1, 0.5);
+      fx.shockwave(e.x, e.y, e.z, 1.6, 0x5cff8a);
+      hud.word('BOING!', V(e.x, e.y + 1.5, e.z), { size: 36, colors: ['#5cff8a', '#ffffff'] });
+      sfx.play('boing');
+      break;
     case 'splat':
       fx.impact(e.x, e.y, e.z, 12, 0xff6fb5);
-      hud.word('SPLAT!', tmp.set(e.x, e.y, e.z), { size: 48, colors: ['#ff6fb5', '#ffffff'] });
+      hud.word('SPLAT!', V(e.x, e.y, e.z), { size: 48, colors: ['#ff6fb5', '#ffffff'] });
       sfx.play('splat');
-      cam.addTrauma(0.45);
+      shake(V(e.x, e.y, e.z), 0.45, [e.id]);
       break;
-    case 'block':
+    case 'block': {
       fx.impact(e.x, e.y, e.z, 4, 0x2f6cf0);
-      hud.word('BLOCK!', tmp.set(e.x, e.y, e.z), { size: 30, colors: ['#ffffff', '#2f6cf0'] });
+      hud.word('BLOCK!', V(e.x, e.y, e.z), { size: 30, colors: ['#ffffff', '#2f6cf0'] });
       sfx.play('block');
+      const v = views.get(e.v);
+      if (v) v.blocked();
       if (isLocal(e.v)) rumble(e.v, 0.2, 0.3, 70);
       break;
+    }
     case 'parry':
       fx.impact(e.x, e.y, e.z, 18, 0x2fd4ff);
-      hud.word('PARRY!', tmp.set(e.x, e.y, e.z), { size: 64, colors: ['#2fd4ff', '#ffffff'], spikes: 16 });
+      hud.word('PARRY!', V(e.x, e.y, e.z), { size: 64, colors: ['#2fd4ff', '#ffffff'], spikes: 16 });
       sfx.play('parry');
       hud.flash(0.35);
-      cam.addTrauma(0.4);
-      bigMoment(tmp.set(e.x, e.y, e.z), 18);
+      shake(V(e.x, e.y, e.z), 0.4, [e.v, e.a]);
+      bigMoment(V(e.x, e.y, e.z), 18);
       break;
     case 'guardbreak':
       fx.impact(e.x, e.y, e.z, 20, 0xef2f2a);
-      hud.word('GUARD BREAK!', tmp.set(e.x, e.y, e.z), { size: 58, colors: ['#ffffff', '#ef2f2a'], spikes: 16 });
+      hud.word('GUARD BREAK!', V(e.x, e.y, e.z), { size: 58, colors: ['#ffffff', '#ef2f2a'], spikes: 16 });
       sfx.play('guardbreak');
-      cam.addTrauma(0.55);
-      bigMoment(tmp.set(e.x, e.y, e.z), 20, 0.06);
+      shake(V(e.x, e.y, e.z), 0.55, [e.v, e.a]);
+      bigMoment(V(e.x, e.y, e.z), 20, 0.06);
       break;
     case 'grab':
       sfx.play('grab');
-      hud.word(e.dr ? 'YOINK!' : 'GOTCHA!', tmp.set(e.x, e.y + 0.4, e.z), { size: 30, colors: ['#ffffff', '#2fd4b8'] });
+      hud.word(e.dr ? 'YOINK!' : 'GOTCHA!', V(e.x, e.y + 0.4, e.z), { size: 30, colors: ['#ffffff', '#2fd4b8'] });
       if (isLocal(e.v)) rumble(e.v, 0.4, 0.4, 120);
       break;
     case 'lift': {
       sfx.play('lift');
-      const p = playerPos(e.a, tmp);
-      if (p) hud.word('UPSY-DAISY!', p.add(new THREE.Vector3(0, 3.2, 0)), { size: 32, colors: ['#ffd21f', '#9b5cf0'] });
+      const p = above(e.a, 3.2);
+      if (p) hud.word('UPSY-DAISY!', p, { size: 32, colors: ['#ffd21f', '#9b5cf0'] });
       break;
     }
     case 'throw':
       sfx.play('throw');
-      if (e.w) hud.word(e.w, tmp.set(e.x, e.y, e.z), { size: e.lf ? 52 : 36, colors: ['#ffffff', '#ff8a00'] });
-      if (e.v !== undefined) cam.addTrauma(0.3);
+      if (e.w) hud.word(e.w, V(e.x, e.y, e.z), { size: e.lf ? 52 : 36, colors: ['#ffffff', '#ff8a00'] });
+      if (e.v !== undefined) shake(V(e.x, e.y, e.z), 0.3, [e.a]);
       if (isLocal(e.a)) rumble(e.a, 0.5, 0.3, 120);
+      break;
+    case 'catch':
+      sfx.play('catch');
+      hud.word('NICE CATCH!', V(e.x, e.y + 0.6, e.z), { size: 34, colors: ['#ffffff', '#2fd4b8'] });
+      if (isLocal(e.id)) rumble(e.id, 0.3, 0.4, 90);
       break;
     case 'escape':
       sfx.play(e.w === 'WAKE UP!' ? 'wake' : 'escape');
-      hud.word(e.w, tmp.set(e.x, e.y, e.z), { size: 36, colors: ['#ffffff', '#5ccf3a'] });
+      hud.word(e.w, V(e.x, e.y, e.z), { size: 36, colors: ['#ffffff', '#5ccf3a'] });
       fx.dust(e.x, e.y - 1.4, e.z, 6, 1, 0.5);
       break;
     case 'pickup': {
       sfx.play('pickup');
-      const p = playerPos(e.id, tmp);
-      if (p && ITEMS[e.k]) hud.word(ITEMS[e.k].label + '!', p.add(new THREE.Vector3(0, 2.6, 0)), { size: 24, plain: true, colors: ['#ffd21f'] });
+      const p = above(e.id, 2.6);
+      if (p && ITEMS[e.k]) hud.word(ITEMS[e.k].label + '!', p, { size: 24, plain: true, colors: ['#ffd21f'], only: isLocal(e.id) ? viewIndexOf(e.id) : -1 });
       break;
     }
     case 'break':
-      fx.debris(e.x, e.y, e.z, PROP_COLORS[e.k] || [0xc98b45], 14, 12, 0);
+      fx.debris(e.x, e.y, e.z, PROP_COLORS[e.k] || [0xc98b45], 14, 12, e.y - 1.5);
       fx.dust(e.x, e.y - 0.3, e.z, 5, 1, 0.6);
-      hud.word(e.w, tmp.set(e.x, e.y, e.z), { size: 44 });
-      sfx.play('break');
-      cam.addTrauma(0.3);
+      hud.word(e.w, V(e.x, e.y, e.z), { size: 44 });
+      sfx.play(e.k === 'vase' || e.k === 'tv' ? 'glass' : 'break');
+      shake(V(e.x, e.y, e.z), 0.3);
       break;
     case 'explode': {
-      const pos = new THREE.Vector3(e.x, e.y, e.z);
+      const pos = V(e.x, e.y, e.z);
       fx.explosion(e.x, e.y, e.z);
       hud.word(e.w, pos, { size: 96, colors: ['#ffd21f', '#ef2f2a'], spikes: 18, dur: 1.2 });
       hud.flash(0.7);
-      cam.addTrauma(1);
+      shake(pos, 1);
       bigMoment(pos, 30, 0.1);
       sfx.play('boom');
       for (const id of local.keys()) {
         const p = playerPos(id, tmp2);
-        if (p && p.distanceTo(pos) < 9) rumble(id, 1, 1, 450);
+        if (p && p.distanceTo(pos) < (e.r || 4) * 2.2) rumble(id, 1, 1, 450);
       }
       break;
     }
+    case 'shoot': {
+      const v = views.get(e.id);
+      if (v) v.shot();
+      fx.muzzle(e.x, e.y, e.z, e.f, GUN_FLASH[e.k] || 0xffe14d, e.k === 'blunderbuss' || e.k === 'rocket' ? 1.6 : 1);
+      sfx.play(GUN_SFX[e.k] || 'pop');
+      if (e.w) hud.word(e.w, V(e.x, e.y + 0.5, e.z), { size: e.k === 'rocket' || e.k === 'blunderbuss' ? 42 : 30, colors: ['#ffffff', '#ff8a00'] });
+      if (isLocal(e.id)) {
+        const L = local.get(e.id);
+        L.cam.addTrauma(e.k === 'blunderbuss' || e.k === 'rocket' ? 0.35 : e.k === 'flamethrower' || e.k === 'acidgun' ? 0.03 : 0.12);
+        rumble(e.id, e.k === 'blunderbuss' || e.k === 'rocket' ? 0.8 : 0.2, 0.4, 80);
+      }
+      break;
+    }
+    case 'empty':
+    case 'click': {
+      sfx.play('click');
+      const p = above(e.id, 2.4);
+      if (p && e.e === 'empty') hud.word('CLICK!', p, { size: 24, plain: true, colors: ['#ffffff'] });
+      break;
+    }
+    case 'ignite': {
+      sfx.play('flame');
+      const p = above(e.id, 1.2);
+      if (p) {
+        fx.flames(p.x, p.y - 1, p.z, 8);
+        hud.word('FWOOSH!', p, { size: 40, colors: ['#ffd21f', '#ef2f2a'] });
+      }
+      break;
+    }
+    case 'burnYell': {
+      const p = above(e.id, 2.8);
+      if (p) hud.word(e.w, p, { size: 28, plain: true, colors: ['#ff8a00'] });
+      break;
+    }
+    case 'extinguish': {
+      sfx.play('sizzle');
+      const p = playerPos(e.id, tmp);
+      if (p) for (let i = 0; i < 5; i++) fx.puff(p.x, p.y + 1, p.z, 0xd8d4e8, 0.6);
+      break;
+    }
+    case 'acid': {
+      sfx.play('acid');
+      const p = above(e.id, 2.4);
+      if (p) {
+        fx.splash(p.x, p.y - 2.2, p.z, 0x8aff4a, 8);
+        hud.word('SIZZLE!', p, { size: 30, colors: ['#8aff4a', '#15101e'] });
+      }
+      break;
+    }
+    case 'crush': {
+      const v = views.get(e.id);
+      if (v) v.crush();
+      sfx.play('crush');
+      const p = above(e.id, 1);
+      if (p) {
+        hud.word('SQUISH!', p, { size: 60, colors: ['#ffffff', '#ef2f2a'], spikes: 16 });
+        fx.dust(p.x, p.y - 1, p.z, 10, 1.6, 0.7);
+        shake(p, 0.6, [e.id]);
+      }
+      break;
+    }
+    case 'pie': {
+      const v = views.get(e.v);
+      if (v) v.pie();
+      sfx.play('splat');
+      const p = above(e.v, 1.6);
+      if (p) {
+        fx.splash(p.x, p.y, p.z, 0xfff3d6, 14);
+        hud.word('PIE IN THE FACE!', p.add(new THREE.Vector3(0, 0.8, 0)), { size: 36, colors: ['#ff6fb5', '#ffffff'] });
+      }
+      break;
+    }
+    case 'slip':
+      sfx.play('squeak');
+      hud.word(e.w, V(e.x, e.y, e.z), { size: 40, colors: ['#ffd21f', '#2f6cf0'] });
+      fx.dust(e.x, e.y - 1, e.z, 5, 0.8, 0.5);
+      break;
+    case 'squash': {
+      const pos = V(e.x, e.y + 0.6, e.z);
+      sfx.play('squash');
+      fx.impact(pos.x, pos.y, pos.z, 26, 0xef2f2a);
+      fx.debris(pos.x, pos.y, pos.z, [0xffd21f, 0xef2f2a], 10, 10, e.y);
+      hud.word(e.w || 'FLATTENED!', pos, { size: 70, colors: ['#ffffff', '#ef2f2a'], spikes: 18, dur: 1.2 });
+      shake(pos, 0.8, [e.id]);
+      if (isLocal(e.id)) rumble(e.id, 1, 1, 500);
+      break;
+    }
+    case 'finish': {
+      const pos = V(e.x, e.y + 2, e.z);
+      sfx.play('finish');
+      fx.confetti(pos.x, pos.y, pos.z, 90);
+      hud.word('FINISH!', pos, { size: 80, colors: ['#ffd21f', '#2fd4b8'], spikes: 18, dur: 1.4 });
+      hud.flash(0.4);
+      break;
+    }
+    case 'super': {
+      const pos = V(e.x, e.y, e.z);
+      sfx.play('super');
+      hud.word('SPIN-O-RAMA!', pos, { size: 72, colors: ['#ffffff', '#9b5cf0'], spikes: 18, dur: 1.3 });
+      hud.flash(0.45);
+      fx.shockwave(e.x, e.y - 2, e.z, 4, 0x9b5cf0);
+      shake(pos, 0.5, [e.id]);
+      bigMoment(pos, 24, 0.08);
+      if (isLocal(e.id)) rumble(e.id, 0.6, 0.9, 400);
+      break;
+    }
+    case 'superReady':
+      if (isLocal(e.id)) {
+        sfx.play('superReady');
+        const p = above(e.id, 3);
+        if (p) hud.word('SUPER READY! (LB / T)', p, { size: 30, colors: ['#ffd21f', '#9b5cf0'], only: viewIndexOf(e.id), dur: 1.4 });
+        rumble(e.id, 0.2, 0.5, 150);
+      }
+      break;
+    case 'hang':
+      sfx.play('cling');
+      fx.dust(e.x, e.y, e.z, 4, 0.5, 0.35);
+      if (isLocal(e.id)) rumble(e.id, 0.25, 0.2, 80);
+      break;
+    case 'cling':
+      sfx.play('cling');
+      break;
+    case 'climb':
+      sfx.play('climb');
+      break;
+    case 'tired':
+      hud.word('SO TIRED...', V(e.x, e.y, e.z), { size: 24, plain: true, colors: ['#b7a6ff'] });
+      break;
+    case 'pound':
+      fx.shockwave(e.x, e.y, e.z, 3.4, 0xffffff);
+      fx.dust(e.x, e.y, e.z, 12, 1.8, 0.8);
+      fx.debris(e.x, e.y + 0.1, e.z, [0xe8342c, 0xffcc1f], 6, 8, e.y);
+      hud.word('KA-THOOM!', V(e.x, e.y + 1, e.z), { size: 52, colors: ['#ffffff', '#2f6cf0'] });
+      shake(V(e.x, e.y, e.z), 0.6, [e.id]);
+      sfx.play('land', 24);
+      break;
+    case 'snowWarn':
+      fx.dropMarker(e.x, e.y, e.z, Math.max(0.6, (e.t || 60) / 60));
+      break;
+    case 'snowHit':
+      fx.splash(e.x, e.y + 0.3, e.z, 0xffffff, 16);
+      fx.dust(e.x, e.y, e.z, 8, 1.5, 0.8);
+      hud.word('WHUMPF!', V(e.x, e.y + 1, e.z), { size: 44, colors: ['#ffffff', '#2fd4ff'] });
+      sfx.play('snow');
+      shake(V(e.x, e.y, e.z), 0.4);
+      break;
     case 'knockout': {
-      const pos = new THREE.Vector3(e.x, e.y, e.z);
+      const pos = V(e.x, e.y, e.z);
       hud.word('KNOCKOUT!', pos, { size: 76, colors: ['#ffffff', '#9b5cf0'], spikes: 18, dur: 1.3 });
       fx.impact(e.x, e.y, e.z, 22, 0x9b5cf0);
       sfx.play('knockout');
-      cam.addTrauma(0.7);
+      shake(pos, 0.7, [e.id]);
       bigMoment(pos, 26, 0.1);
       hud.flash(0.4);
       if (isLocal(e.id)) rumble(e.id, 1, 0.8, 500);
       break;
     }
     case 'wake':
-      hud.word('HUH?!', tmp.set(e.x, e.y, e.z), { size: 30, plain: true, colors: ['#ffffff'] });
+      hud.word('HUH?!', V(e.x, e.y, e.z), { size: 30, plain: true, colors: ['#ffffff'] });
       sfx.play('wake');
       break;
     case 'out': {
       const r = roster.get(e.id);
-      const pos = new THREE.Vector3(e.x, Math.max(e.y, -6), e.z);
-      hud.word('RING OUT!', pos, { size: 80, colors: ['#ef2f2a', '#ffd21f'], spikes: 18, dur: 1.4 });
-      sfx.play('out');
-      cam.addTrauma(0.5);
-      if (r && !r.dummy) {
+      const lv = level ? level.lv : LEVELS[0];
+      const pos = V(e.x, Math.max(e.y, lv.killY + 2), e.z);
+      const word = e.sq ? 'SQUASHED!' : lv.outWord || 'RING OUT!';
+      hud.word(word, pos, { size: 80, colors: ['#ef2f2a', '#ffd21f'], spikes: 18, dur: 1.4 });
+      sfx.play(e.sq ? 'squash' : 'out');
+      shake(pos, 0.5, [e.id]);
+      if (r && !r.dummy && latestPhase() !== PHASE.LOBBY) {
         const by = roster.get(e.by);
-        hud.announce(`${r.name.toUpperCase()} IS OUTTA HERE!`, by ? `KO by ${by.name}` : '', 'small');
+        const verb = lv.mode === 'race' ? (e.sq ? 'GOT FLATTENED!' : 'IS OUT OF THE RACE!') : 'IS OUTTA HERE!';
+        hud.announce(`${r.name.toUpperCase()} ${verb}`, by && by.id !== e.id ? `KO by ${by.name}` : '', 'small');
+        // final knockout of the round: dramatic slow motion
+        if (e.left <= 1 && latestPhase() === PHASE.FIGHT) slowT = 1.1;
       }
-      if (isLocal(e.id)) rumble(e.id, 0.8, 0.8, 600);
+      if (isLocal(e.id)) {
+        rumble(e.id, 0.8, 0.8, 600);
+        const L = local.get(e.id);
+        L.specId = e.by >= 0 && e.by !== e.id ? e.by : -1;
+      }
       break;
     }
     case 'spawn':
@@ -543,8 +844,8 @@ function onEvent(e) {
       if (e.s > 6) fx.dust(e.x, e.y - 0.4, e.z, 4, 0.7, 0.4);
       break;
     case 'taunt': {
-      const p = playerPos(e.id, tmp);
-      if (p) hud.word(e.w, p.add(new THREE.Vector3(0, 2.8, 0)), { size: 34, colors: ['#ffffff', '#ff6fb5'] });
+      const p = above(e.id, 2.8);
+      if (p) hud.word(e.w, p, { size: 34, colors: ['#ffffff', '#ff6fb5'] });
       sfx.play('taunt');
       break;
     }
@@ -565,16 +866,21 @@ function onEvent(e) {
       fx.shockwave(e.x, e.y, e.z, 2.6 + (e.c || 0) * 1.4, 0xffe14d);
       fx.dust(e.x, e.y, e.z, 10, 1.6, 0.8);
       fx.debris(e.x, e.y + 0.1, e.z, [0xe8342c, 0xffcc1f], 8, 8, e.y);
-      cam.addTrauma(0.5);
+      shake(V(e.x, e.y, e.z), 0.5, [e.id]);
       sfx.play('land', 18);
       break;
+    case 'level': {
+      const lv = LEVELS[e.lv];
+      if (lv) hud.announce(lv.name, lv.tagline, 'level');
+      break;
+    }
     case 'announce':
       hud.announce(e.text, e.sub, e.style);
       if (e.style === 'count') sfx.play('beep');
       else if (e.style === 'go') {
         sfx.play('go');
         hud.flash(0.5);
-        cam.addTrauma(0.4);
+        for (const v of viewList) v.cam.addTrauma(0.4);
       } else if (e.style === 'win' || e.style === 'champ') sfx.play('win');
       break;
     case 'roundWin':
@@ -600,53 +906,11 @@ function processEvents(t) {
   }
 }
 
-// ------------------------------------------------------------------ camera rig
-const cam = {
-  target: new THREE.Vector3(0, 0, 1),
-  dist: 26,
-  trauma: 0,
-  kick: new THREE.Vector3(),
-  time: 0,
-  addTrauma(v) {
-    this.trauma = Math.min(1, this.trauma + v);
-  },
-  punch(pos, k) {
-    tmp2.copy(pos).sub(camera.position).normalize().multiplyScalar(k * 0.6);
-    this.kick.add(tmp2);
-  },
-  update(dt, points) {
-    this.time += dt;
-    let cx = 0, cz = 0, cy = 0, n = 0;
-    let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
-    for (const p of points) {
-      cx += p.x; cz += p.z; cy += p.y; n++;
-      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-      minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
-    }
-    if (!n) { cx = 0; cz = 0; n = 1; minX = maxX = 0; minZ = maxZ = 0; }
-    const mid = new THREE.Vector3((minX + maxX) / 2, Math.min(3, Math.max(0, cy / n)), (minZ + maxZ) / 2 + 0.5);
-    const spread = Math.max(maxX - minX, (maxZ - minZ) * 1.5);
-    const wantDist = Math.min(40, Math.max(12.5, 10 + spread * 0.95));
-    const k = 1 - Math.exp(-dt * 3.2);
-    this.target.lerp(mid, k);
-    this.dist += (wantDist - this.dist) * (1 - Math.exp(-dt * 2.2));
-    const pitch = 0.92; // ~53 degrees down
-    camera.position.set(this.target.x, this.target.y + Math.sin(pitch) * this.dist, this.target.z + Math.cos(pitch) * this.dist);
-    this.trauma = Math.max(0, this.trauma - dt * 1.7);
-    const sh = this.trauma * this.trauma;
-    const t = this.time * 40;
-    camera.position.x += (Math.sin(t * 1.1) + Math.sin(t * 2.3)) * 0.35 * sh;
-    camera.position.y += (Math.sin(t * 1.7) + Math.sin(t * 3.1)) * 0.3 * sh;
-    camera.position.add(this.kick);
-    this.kick.multiplyScalar(Math.exp(-dt * 10));
-    camera.lookAt(this.target.x, this.target.y + 0.6, this.target.z);
-    camera.rotateZ((Math.sin(t * 0.9) * 0.02) * sh);
-    sun.position.set(this.target.x + 14, 30, this.target.z + 16);
-    sun.target.position.set(this.target.x, 0, this.target.z);
-  },
-};
+// ------------------------------------------------------------------ props, bullets, puddles
+const _q = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+const _zAxis = new THREE.Vector3(0, 0, 1);
 
-// ------------------------------------------------------------------ props
 function updateProps(sample, dt) {
   const seen = new Set();
   for (const [id, ps] of sample.props) {
@@ -672,6 +936,7 @@ function updateProps(sample, dt) {
       if (!heavy) v.group.rotation.set(Math.PI, 0, 0);
       else if (v.kind === 'tire') v.group.rotation.set(Math.PI / 2, 0, 0);
       v.inner.position.y = 0;
+      v.group.visible = !ps.f || Math.floor(performance.now() / 70) % 2 === 0;
       continue;
     }
     if (v.group.parent !== scene) scene.add(v.group);
@@ -685,7 +950,7 @@ function updateProps(sample, dt) {
       const h = Math.hypot(ps.vx, ps.vz) || 1;
       tmp.set(ps.vz / h, 0, -ps.vx / h);
       v.group.quaternion.setFromAxisAngle(tmp, v.spin);
-      if (!heavy) v.group.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2));
+      if (!heavy) v.group.quaternion.multiply(_q.setFromAxisAngle(_zAxis, Math.PI / 2));
     } else {
       // resting: weapons lie flat, heavy things sit / roll
       const h = Math.hypot(ps.vx, ps.vz);
@@ -700,20 +965,89 @@ function updateProps(sample, dt) {
         v.group.position.y = ps.y - def.r * 0.55;
       }
     }
-    // fuse blink
-    if (ps.f) v.group.visible = Math.floor(performance.now() / 70) % 2 === 0;
-    else v.group.visible = true;
+    // lit fuse: blink + sparks
+    if (ps.f) {
+      v.group.visible = Math.floor(performance.now() / 70) % 2 === 0;
+      if (Math.random() < 0.3) fx.flames(ps.x, ps.y + 0.3, ps.z, 1);
+    } else v.group.visible = true;
   }
   for (const [id, v] of propViews) {
     if (!seen.has(id)) {
-      v.group.parent && v.group.parent.remove(v.group);
+      if (v.group.parent) v.group.parent.remove(v.group);
       propViews.delete(id);
     }
   }
 }
 
+function updateBullets(list, dt) {
+  const seen = new Set();
+  for (const b of list) {
+    const [id, kind, x, y, z, vx, vy, vz] = b;
+    seen.add(id);
+    let m = bulletViews.get(id);
+    if (!m) {
+      m = buildBullet(kind);
+      m.userData.age = 0;
+      scene.add(m);
+      bulletViews.set(id, m);
+    }
+    m.userData.age += dt;
+    m.position.set(x, y, z);
+    const sp = Math.hypot(vx, vy, vz);
+    if (sp > 0.01) {
+      tmp.set(vx / sp, vy / sp, vz / sp);
+      m.quaternion.setFromUnitVectors(_up, tmp);
+    }
+    if (kind === 'flame') {
+      const a = m.userData.age;
+      m.scale.setScalar(0.5 + a * 3.5);
+      m.material.opacity = Math.max(0, 0.9 - a * 1.6);
+      m.material.color.setHex(a < 0.12 ? 0xffe14d : a < 0.25 ? 0xffa31a : 0xef2f2a);
+      m.rotation.z += dt * 9;
+    } else if (kind === 'rocket') {
+      if (Math.random() < 0.7) fx.puff(x - vx * 0.02, y - vy * 0.02, z - vz * 0.02, 0xd8d4e8, 0.45);
+    } else if (kind === 'acid') {
+      if (Math.random() < 0.25) fx.drip(x, y - 0.4, z);
+    }
+  }
+  for (const [id, m] of bulletViews) {
+    if (!seen.has(id)) {
+      scene.remove(m);
+      bulletViews.delete(id);
+    }
+  }
+}
+
+const puddleGeo = new THREE.CircleGeometry(1, 28);
+function updatePuddles(list, time) {
+  while (puddleMeshes.length < list.length) {
+    const g = new THREE.Group();
+    const outer = new THREE.Mesh(puddleGeo, new THREE.MeshBasicMaterial({ color: 0x2f7a10, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
+    const inner = new THREE.Mesh(puddleGeo, new THREE.MeshBasicMaterial({ color: 0x8aff4a, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3 }));
+    outer.rotation.x = inner.rotation.x = -Math.PI / 2;
+    inner.scale.setScalar(0.82);
+    inner.position.y = 0.005;
+    g.add(outer, inner);
+    g.traverse((o) => o.layers.set(1));
+    scene.add(g);
+    puddleMeshes.push(g);
+  }
+  puddleMeshes.forEach((g, i) => {
+    const d = list[i];
+    g.visible = !!d;
+    if (!d) return;
+    const [x, y, z, r, t] = d;
+    const fade = Math.min(1, t / 60);
+    g.position.set(x, y + 0.03, z);
+    g.scale.setScalar(r * (0.95 + Math.sin(time * 4 + i) * 0.04) * (0.4 + fade * 0.6));
+    g.children[0].material.opacity = 0.75 * fade;
+    g.children[1].material.opacity = 0.8 * fade;
+    if (Math.random() < 0.05 * r) fx.drip(x + (Math.random() - 0.5) * r, y - 0.3, z + (Math.random() - 0.5) * r, 0xb8ff7a);
+  });
+}
+
 // ------------------------------------------------------------------ per-frame player render state
-const P_ATTACK_KINDS = new Set(['swing', 'slam', 'hay', 'hook', 'kick', 'dk']);
+const P_ATTACK_KINDS = new Set(['swing', 'slam', 'hay', 'hook', 'kick', 'dk', 'spear', 'slide']);
 const _wq = new THREE.Quaternion();
 
 function buildRenderStates(sample, dt) {
@@ -722,8 +1056,9 @@ function buildRenderStates(sample, dt) {
     const s = states.get(id);
     if (!s) continue;
     // position: predicted when possible, interpolated otherwise; blend between them
+    const usePred = L.pred.active && s.s !== ST.DEAD && slowLag <= 0;
     let base;
-    if (L.pred.active && s.s !== ST.DEAD) {
+    if (usePred) {
       base = tmp.set(L.pred.s.x, L.pred.s.y, L.pred.s.z);
       s.vx = L.pred.s.vx;
       s.vy = L.pred.s.vy;
@@ -732,10 +1067,10 @@ function buildRenderStates(sample, dt) {
       if (s.s === ST.FREE || s.s === ST.BLOCK || s.s === ST.CHARGE) s.f = L.pred.facing;
     } else base = tmp.set(s.x, s.y, s.z);
     if (!L.renderPos) L.renderPos = base.clone();
-    if (L.wasPred !== L.pred.active) {
+    if (L.wasPred !== usePred) {
       L.err.copy(L.renderPos).sub(base);
       if (L.err.length() > 4) L.err.set(0, 0, 0);
-      L.wasPred = L.pred.active;
+      L.wasPred = usePred;
     }
     L.err.multiplyScalar(Math.exp(-dt * 9));
     L.renderPos.copy(base).add(L.err);
@@ -759,7 +1094,7 @@ function buildRenderStates(sample, dt) {
     }
   }
   // carried victims follow their (possibly predicted) carrier
-  for (const [id, s] of states) {
+  for (const s of states.values()) {
     if (s.s === ST.HELD && s.gb >= 0 && local.has(s.gb)) {
       const g = states.get(s.gb);
       if (g && g.rx !== undefined) {
@@ -774,7 +1109,7 @@ function buildRenderStates(sample, dt) {
 function updateTrails(states) {
   for (const [id, s] of states) {
     const v = views.get(id);
-    if (!v || !s.a || s.s !== ST.ATTACK) continue;
+    if (!v || !s.a || (s.s !== ST.ATTACK && s.s !== ST.SUPER)) continue;
     const [k, t, w, a] = s.a;
     if (!P_ATTACK_KINDS.has(k) || t < w - 0.5 || t > w + a + 1.5) continue;
     if (k === 'swing' || k === 'slam') {
@@ -785,7 +1120,7 @@ function updateTrails(states) {
       tmp2.set(0, -1, 0).applyQuaternion(_wq).multiplyScalar(len).add(tmp);
       const base = tmp.clone().lerp(tmp2, 0.25);
       fx.trail(id + ':w', base, tmp2, s.a[5] > 0.8 ? 0xffe14d : 0xffffff);
-    } else if (k === 'kick' || k === 'dk') {
+    } else if (k === 'kick' || k === 'dk' || k === 'slide') {
       v.legR.end.getWorldPosition(tmp2);
       v.legR.joint.getWorldPosition(tmp);
       fx.trail(id + ':k', tmp.lerp(tmp2, 0.6), tmp2.clone(), 0xffffff);
@@ -793,44 +1128,167 @@ function updateTrails(states) {
       const arm = k === 'jab2' ? v.armL : v.armR;
       arm.end.getWorldPosition(tmp2);
       arm.joint.getWorldPosition(tmp);
-      fx.trail(id + ':p', tmp.lerp(tmp2, 0.55), tmp2.clone(), k === 'hay' && s.a[5] > 0.8 ? 0xffe14d : 0xffffff);
+      fx.trail(id + ':p', tmp.lerp(tmp2, 0.55), tmp2.clone(), (k === 'hay' && s.a[5] > 0.8) || k === 'spear' ? 0xffe14d : 0xffffff);
     }
   }
 }
 
 let streakT = 0;
 let dustT = 0;
+let statusT = 0;
 function ambientFx(states, dt) {
   streakT += dt;
   dustT += dt;
+  statusT += dt;
   const doStreak = streakT > 0.035;
   const doDust = dustT > 0.16;
+  const doStatus = statusT > 0.06;
   if (doStreak) streakT = 0;
   if (doDust) dustT = 0;
-  for (const [id, s] of states) {
+  if (doStatus) statusT = 0;
+  for (const s of states.values()) {
     if (s.s === ST.DEAD) continue;
     const sp = Math.hypot(s.vx, s.vz);
     const x = s.rx ?? s.x, y = s.ry ?? s.y, z = s.rz ?? s.z;
     if (doStreak && s.s === ST.TUMBLE && Math.hypot(sp, s.vy) > 10) fx.streak(x, y + 0.9, z, s.vx, s.vy, s.vz);
+    if (doStreak && s.s === ST.FREE && s.og && (s.sp | 0) >= SPRINT.TICKS && sp > 7) fx.streak(x, y + 0.9, z, s.vx, 0, s.vz);
     if (doDust && s.og && sp > 6.5 && (s.s === ST.FREE || s.s === ST.HELD)) fx.dust(x - s.vx * 0.04, y, z - s.vz * 0.04, 1, 0.3, 0.35);
     if (doDust && s.s === ST.HELD && s.dr && sp > 2) fx.dust(x, y, z, 2, 0.4, 0.45);
+    if (doStatus && s.fi) fx.flames(x, y + 0.5, z, 2);
+    if (doStatus && s.ac && Math.random() < 0.5) fx.drip(x, y, z);
+    if (doStatus && s.s === ST.SUPER) fx.streak(x, y + 1, z, Math.cos(performance.now() / 60) * 14, 0, Math.sin(performance.now() / 60) * 14);
   }
 }
 
+// ------------------------------------------------------------------ cameras / viewports
+const ZERO = { x: 0, z: 0 };
+const FOLLOW_STATES = new Set([ST.FREE, ST.BLOCK, ST.CHARGE, ST.ATTACK, ST.TAUNT]);
+const camBoxBuf = [];
+
+function computeViews(snap) {
+  const inLobby = !snap || snap.ph === PHASE.LOBBY;
+  const players = sortedLocals().filter((L) => !(inLobby && !lobby.isPracticing(L.id)));
+  if (!players.length) return [{ L: null, cam: overviewCam }];
+  return players.map((L) => ({ L, cam: L.cam }));
+}
+
+function spectateTarget(L, states) {
+  const alive = (id) => {
+    const s = states.get(id);
+    const r = roster.get(id);
+    return s && r && !r.dummy && s.s !== ST.DEAD ? s : null;
+  };
+  if (L.specId >= 0 && alive(L.specId)) return alive(L.specId);
+  for (const id of roster.keys()) {
+    if (alive(id)) {
+      L.specId = id;
+      return alive(id);
+    }
+  }
+  return null;
+}
+
+const posOf = (s) => ({ x: s.rx ?? s.x, y: s.ry ?? s.y, z: s.rz ?? s.z });
+
+function updateCameras(dt, smp) {
+  const states = smp ? smp.states : new Map();
+  if (camResetT > 0 && (camResetT -= dt) <= 0) for (const L of local.values()) L.cam.ready = false;
+  const boxes = level ? levelBoxesAt(level.lv, smp ? smp.time : performance.now() / 1000, camBoxBuf) : null;
+  for (const v of viewList) {
+    const cam = v.cam;
+    if (!v.L) {
+      // overview: drift around the action
+      let n = 0;
+      tmp.set(0, 0, 0);
+      for (const [id, s] of states) {
+        const r = roster.get(id);
+        if (!r || s.s === ST.DEAD || (r.dummy && n > 0)) continue;
+        const p = posOf(s);
+        tmp.x += p.x; tmp.y += Math.max(levelCenter.y, p.y); tmp.z += p.z;
+        n++;
+      }
+      if (n) tmp.divideScalar(n);
+      else tmp.copy(levelCenter);
+      cam.yaw += dt * 0.07;
+      cam.update(dt, tmp, ZERO, cam.yaw - Math.PI, null, true);
+      continue;
+    }
+    const L = v.L;
+    const s = states.get(L.id);
+    let vel = ZERO;
+    let steer = null;
+    if (s && s.s !== ST.DEAD) {
+      L.deadT = 0;
+      L.specId = -1;
+      const p = posOf(s);
+      L.focus.set(p.x, p.y, p.z);
+      if (FOLLOW_STATES.has(s.s) || (s.s === ST.HELD && s.dr)) vel = { x: s.vx, z: s.vz };
+      if (s.s === ST.HANG || s.s === ST.CLIMB) steer = s.f + Math.PI;
+    } else {
+      L.deadT += dt;
+      if (L.deadT > 1.6) {
+        // spectate whoever is still standing, or drift back over the stage to wait for a respawn
+        const t = spectateTarget(L, states);
+        if (t) {
+          const p = posOf(t);
+          L.focus.lerp(tmp.set(p.x, p.y, p.z), 1 - Math.exp(-dt * 4));
+          vel = { x: t.vx, z: t.vz };
+        } else L.focus.lerp(levelCenter, 1 - Math.exp(-dt * 1.5));
+      }
+    }
+    cam.update(dt, L.focus, vel, s ? s.f : 0, boxes, false, steer);
+  }
+}
+
+function followSun() {
+  if (!viewList.length) return;
+  let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
+  for (const v of viewList) {
+    const t = v.cam.target;
+    minX = Math.min(minX, t.x); maxX = Math.max(maxX, t.x);
+    minZ = Math.min(minZ, t.z); maxZ = Math.max(maxZ, t.z);
+  }
+  const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+  const cy = viewList[0].cam.target.y;
+  const half = Math.min(80, Math.max(26, Math.max(maxX - minX, maxZ - minZ) / 2 + 22));
+  if (Math.abs(half - shadowHalf) > 3) {
+    shadowHalf = half;
+    const sc = sun.shadow.camera;
+    sc.left = -half;
+    sc.right = half;
+    sc.top = half;
+    sc.bottom = -half;
+    sc.updateProjectionMatrix();
+  }
+  sun.position.set(cx + 18, cy + 40, cz + 20);
+  sun.target.position.set(cx, cy - 2, cz);
+}
+
 // ------------------------------------------------------------------ resize
+let W = 1, H = 1;
 function resize() {
-  const w = window.innerWidth, h = window.innerHeight;
-  renderer.setSize(w, h, false);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-  post.setSize(w, h, renderer.getPixelRatio());
+  W = window.innerWidth;
+  H = window.innerHeight;
+  renderer.setSize(W, H, false);
+  post.setSize(W, H, renderer.getPixelRatio());
 }
 window.addEventListener('resize', resize);
 resize();
+setLevel(0);
+
+// character portraits for the lobby & cards (rendered once with the real models)
+setTimeout(() => {
+  try {
+    const p = renderPortraits(renderer);
+    lobby.setPortraits(p);
+    hud.portraits = p;
+  } catch (err) {
+    console.warn('portraits failed', err);
+  }
+}, 30);
 
 // ------------------------------------------------------------------ main loop
 let last = performance.now();
-let cloudT = 0;
 const ctx = { views, states: null, props: null, roster, localSlots: local };
 
 function frame(now) {
@@ -840,6 +1298,16 @@ function frame(now) {
 
   input.poll();
   handleMeta();
+  const snapNow = net.latest();
+  // camera look (every frame, smooth)
+  for (const L of local.values()) {
+    const look = input.look(L.slot, rawDt);
+    if (!inMenu(L)) L.cam.control(look);
+  }
+  const kb = joinedSlots.get('kb');
+  const kbPlaying = kb !== undefined && local.has(kb) && !inMenu(local.get(kb));
+  input.wantPointerLock = kbPlaying;
+  if (!kbPlaying && document.pointerLockElement) document.exitPointerLock();
   if (welcomed) {
     inputAcc += rawDt;
     let n = 0;
@@ -852,22 +1320,48 @@ function frame(now) {
   }
   input.endFrame();
 
-  // global impact freeze
+  // global impact freeze + final-KO slow motion (the world plays back slower, then catches up)
   let dt = rawDt;
   if (freezeT > 0) {
     freezeT -= rawDt;
     dt = 0;
   }
+  if (slowT > 0) {
+    slowT -= rawDt;
+    slowLag = Math.min(0.9, slowLag + rawDt * 0.7);
+    dt *= 0.3;
+  } else if (slowLag > 0) slowLag = Math.max(0, slowLag - rawDt * 0.6);
 
-  const sample = welcomed && net.snaps.length ? interpolate(net.renderTime()) : null;
+  const renderT = net.renderTime() - slowLag;
+  const sample = welcomed && net.snaps.length ? interpolate(renderT) : null;
   if (sample) {
-    processEvents(net.renderTime());
+    if (sample.snap.lv !== levelIndex) setLevel(sample.snap.lv);
+    processEvents(renderT);
     if (dt > 0 || !lastSample) {
       buildRenderStates(sample, rawDt);
       lastSample = sample;
     }
-  }
+  } else if (meta.lv !== levelIndex && welcomed) setLevel(meta.lv);
   const smp = lastSample;
+
+  // viewports: one third-person camera per local player
+  viewList = computeViews(snapNow);
+  const rects = layoutViewports(viewList.length);
+  viewList.forEach((v, i) => {
+    v.rect = rects[i];
+    const aspect = (rects[i].w * W) / Math.max(1, rects[i].h * H);
+    if (Math.abs(v.cam.camera.aspect - aspect) > 1e-3) {
+      v.cam.camera.aspect = aspect;
+      v.cam.camera.updateProjectionMatrix();
+    }
+  });
+  const captions = viewList.map((v) => {
+    if (!v.L || viewList.length < 2) return '';
+    const r = roster.get(v.L.id);
+    return `${v.L.label}  ${r ? r.name : ''}`;
+  });
+  hud.layout(rects, captions);
+
   if (smp) {
     ctx.states = smp.states;
     ctx.props = smp.props;
@@ -881,50 +1375,41 @@ function frame(now) {
         v.update(s, dt, ctx);
       }
       updateProps(smp, dt);
+      updateBullets(smp.bullets, dt);
       updateTrails(smp.states);
       ambientFx(smp.states, dt);
     }
-    // camera follows living rascals (humans first, dummy if alone)
-    const pts = [];
-    for (const [id, s] of smp.states) {
-      const r = roster.get(id);
-      if (!r || s.s === ST.DEAD || s.y < -4) continue;
-      if (r.dummy) continue;
-      pts.push({ x: s.rx ?? s.x, y: Math.max(0, s.ry ?? s.y), z: s.rz ?? s.z });
-    }
-    if (pts.length < 2) {
-      for (const [id, s] of smp.states) {
-        const r = roster.get(id);
-        if (r && r.dummy && s.s !== ST.DEAD && s.y > -4) pts.push({ x: s.x, y: Math.max(0, s.y), z: s.z });
-      }
-    }
-    cam.update(rawDt, pts);
-    hud.updateCards(roster, smp.states, local, smp.snap.ph);
+    updatePuddles(smp.snap.pd || [], now / 1000);
+    if (level) level.update(smp.time, dt, smp.snap);
+    const practicing = [...local.keys()].some((id) => lobby.isPracticing(id));
+    smp.snap.practice = practicing;
+    hud.updateCards(roster, smp.states, local, smp.snap);
     hud.updatePhase(smp.snap, roster);
-    arena.crane.update(ballPosition(ARENA.ball, smp.snap.time));
-  } else {
-    // attract mode camera drift
-    cam.update(rawDt, [{ x: Math.sin(now / 4000) * 6, y: 0, z: Math.cos(now / 5000) * 3 }]);
-    arena.crane.update(ballPosition(ARENA.ball, now / 1000));
+  } else if (level) {
+    level.update(now / 1000, rawDt, null);
   }
 
-  fx.update(dt, now / 1000);
-  // drifting clouds + flapping bunting
-  cloudT += rawDt;
-  arena.level.children.forEach((o) => {
-    if (o.userData.cloud) o.position.x += o.userData.drift * rawDt;
-    else if (o.userData.flag !== undefined) o.rotation.x = Math.sin(cloudT * 4 + o.userData.flag) * 0.35;
-  });
+  updateCameras(rawDt, smp);
+  followSun();
 
+  // lobby overlay + music mood
+  const phase = snapNow ? snapNow.ph : PHASE.LOBBY;
+  const overlay = welcomed && phase === PHASE.LOBBY && lobby.wantsOverlay([...local.keys()]);
+  lobby.show(overlay);
+  if (overlay) lobby.render(lobbyCtx());
+  music.setIntensity(overlay || phase === PHASE.MATCH_END ? 0 : 1);
+
+  fx.update(dt, now / 1000);
   speedT = Math.max(0, speedT - rawDt);
   impactT = Math.max(0, impactT - rawDt);
   post.uniforms.uSpeed.value = Math.min(1, speedT * 4);
   post.uniforms.uImpact.value = impactT > 0 ? 1 : 0;
-  hud.update(rawDt, camera, window.innerWidth, window.innerHeight, { views, states: smp ? smp.states : new Map(), roster, localSlots: local });
+  const camViews = viewList.map((v) => ({ camera: v.cam.camera, rect: v.rect }));
+  hud.update(rawDt, camViews, W, H, { views, states: smp ? smp.states : new Map(), roster, localSlots: local });
   hud.updateNet(net.rtt, net.connected || !started);
-  post.render(scene, camera, now / 1000);
+  post.render(scene, camViews, now / 1000);
 }
 requestAnimationFrame(frame);
 
 // expose for debugging in the console
-window.__rr = { net, views, roster, local, scene, camera, renderer, input, hud, sfx };
+window.__rr = { net, views, roster, local, scene, renderer, input, hud, sfx, music, lobby, get viewList() { return viewList; }, get level() { return level; } };

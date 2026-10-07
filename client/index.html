@@ -20,8 +20,7 @@
 <body>
   <div id="app">
     <canvas id="game"></canvas>
-    <div id="labels"></div>
-    <div id="fx"></div>
+    <div id="views"></div>
     <div id="flash"></div>
 
     <div id="hud" class="hidden">
@@ -30,18 +29,20 @@
         <div id="phase" class="panel"></div>
         <div id="net" class="panel small"></div>
       </div>
+      <div id="race" class="hidden"></div>
       <div id="announce"></div>
-      <div id="lobby" class="panel hidden"></div>
       <div id="joinbar"></div>
       <div id="cards"></div>
       <div id="help" class="hidden"></div>
     </div>
 
+    <div id="lobbyScreen" class="hidden"></div>
+
     <div id="title">
       <div class="title-rays"></div>
       <div class="title-card">
         <h1 class="logo"><span class="l1">RUMBLE</span><span class="l2">RASCALS!</span></h1>
-        <p class="tagline">The comic-book brawl for up to 8 rascals!</p>
+        <p class="tagline">The comic-book brawl for up to 8 rascals! 5 stages - 8 fighters - 48 weapons</p>
         <div class="form">
           <label>NAME <input id="name" maxlength="14" placeholder="Your rascal name" autocomplete="off" /></label>
           <label>ROOM <input id="room" maxlength="8" placeholder="MAIN" autocomplete="off" /></label>
@@ -49,8 +50,9 @@
         </div>
         <div id="titlepads" class="padinfo">Plug in an Xbox controller &amp; press <b>A</b>, or hit <b>ENTER</b></div>
         <div class="title-controls">
-          <div><b>LT / RT</b> left &amp; right hand grab (both = lift overhead!)</div>
-          <div><b>X</b> punch / swing (hold to charge) &nbsp; <b>Y</b> kick &nbsp; <b>A</b> jump &nbsp; <b>B</b> dodge &nbsp; <b>RB</b> block</div>
+          <div><b>LT / RT</b> left &amp; right hand grab (both = lift overhead!) &nbsp; <b>Right stick</b> your camera</div>
+          <div><b>X</b> punch / swing / shoot &nbsp; <b>Y</b> kick &nbsp; <b>A</b> jump &nbsp; <b>B</b> dodge &nbsp; <b>RB</b> block &nbsp; <b>LB</b> taunt / SUPER</div>
+          <div>Couch co-op: every controller gets its own split-screen camera</div>
         </div>
       </div>
     </div>

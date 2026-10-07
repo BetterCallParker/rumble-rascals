@@ -82,6 +82,7 @@ export class FX {
         break;
     }
     m.userData.kind = kind;
+    m.userData.baseColor = m.material.color.getHex();
     return m;
   }
 
@@ -116,7 +117,7 @@ export class FX {
       flat: o.flat || false,
       axis: o.axis ? o.axis.clone() : null,
     };
-    if (o.color !== undefined) m.material.color.setHex(o.color);
+    m.material.color.setHex(o.color !== undefined ? o.color : m.userData.baseColor);
     if (m.material.opacity !== undefined) m.material.opacity = 1;
     m.position.copy(p.pos);
     m.scale.setScalar(p.s0);
@@ -130,8 +131,24 @@ export class FX {
     return p;
   }
 
+  // Billboards face whichever camera is about to render (split-screen safe)
+  faceCamera(cam) {
+    _q.copy(cam.quaternion).invert();
+    for (const p of this.active) {
+      const m = p.m;
+      if (p.kind === 'spark') {
+        // orient along projected velocity
+        m.quaternion.copy(cam.quaternion);
+        _v.copy(p.vel).applyQuaternion(_q);
+        m.rotateZ(Math.atan2(_v.y, _v.x));
+      } else if (p.bb) {
+        m.quaternion.copy(cam.quaternion);
+        m.rotateZ(p.rot);
+      }
+    }
+  }
+
   update(dt, time) {
-    const cam = this.camera;
     for (let i = this.active.length - 1; i >= 0; i--) {
       const p = this.active[i];
       p.life += dt;
@@ -161,19 +178,10 @@ export class FX {
       } else if (p.kind === 'streak') {
         m.scale.set(p.s1, 0.06, 1);
       } else m.scale.setScalar(Math.max(0.001, s));
-      if (p.bb) {
-        m.quaternion.copy(cam.quaternion);
-        p.rot += p.spin * dt;
-        m.rotateZ(p.rot);
-      } else if (p.spin && !p.flat && !p.axis) {
+      if (p.bb) p.rot += p.spin * dt;
+      else if (p.spin && !p.flat && !p.axis) {
         m.rotation.x += p.spin * dt;
         m.rotation.y += p.spin * 0.7 * dt;
-      }
-      if (p.kind === 'spark') {
-        // orient along projected velocity
-        m.quaternion.copy(cam.quaternion);
-        _v.copy(p.vel).applyQuaternion(_q.copy(cam.quaternion).invert());
-        m.rotateZ(Math.atan2(_v.y, _v.x));
       }
       if (p.kind === 'fire' && p.color2 !== undefined && t > 0.35) m.material.color.setHex(p.color2);
       if (p.kind === 'confetti') {
@@ -283,6 +291,61 @@ export class FX {
     }
     this.debris(x, y, z, [0xe8322c, 0x5a5a68, 0x2b2838], 14, 18, -2);
     this.shockwave(x, Math.max(0, y - 0.5), z, 5.5, 0xffe14d);
+  }
+
+  // burning rascal: licks of flame + a little smoke
+  flames(x, y, z, n = 2) {
+    for (let i = 0; i < n; i++) {
+      this.add('fire', {
+        x: x + (Math.random() - 0.5) * 0.6, y: y + Math.random() * 0.8, z: z + (Math.random() - 0.5) * 0.6,
+        vx: (Math.random() - 0.5) * 0.8, vy: 2.5 + Math.random() * 2, vz: (Math.random() - 0.5) * 0.8,
+        life: 0.35 + Math.random() * 0.25, s0: 0.25, s1: 0.45 + Math.random() * 0.25, s2: 0,
+        color: Math.random() < 0.5 ? 0xffb21f : 0xff4a1a, color2: 0xef2f2a,
+      });
+    }
+    if (Math.random() < 0.3) {
+      this.add('smoke', { x, y: y + 0.9, z, vx: 0, vy: 2, vz: 0, drag: 1, life: 0.8, s0: 0.2, s1: 0.5, s2: 0.1 });
+    }
+  }
+
+  // acid-soaked: green drips falling off
+  drip(x, y, z, color = 0x7cff3a) {
+    this.add('dust', {
+      x: x + (Math.random() - 0.5) * 0.7, y: y + 0.4 + Math.random() * 1.0, z: z + (Math.random() - 0.5) * 0.7,
+      vx: 0, vy: -1, vz: 0, grav: 18, life: 0.5, s0: 0.1, s1: 0.14, s2: 0.06, color, floor: y + 0.02,
+    });
+  }
+
+  splash(x, y, z, color, n = 10) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 1.5 + Math.random() * 3.5;
+      this.add('dust', {
+        x, y, z, vx: Math.cos(a) * sp, vy: 2 + Math.random() * 4, vz: Math.sin(a) * sp,
+        grav: 18, life: 0.6, s0: 0.12, s1: 0.22, s2: 0.05, color, floor: y - 0.6,
+      });
+    }
+  }
+
+  muzzle(x, y, z, yaw, color = 0xffe14d, size = 1) {
+    const dx = Math.sin(yaw), dz = Math.cos(yaw);
+    this.add('burst', { x, y, z, life: 0.08, s0: 0.2 * size, s1: 0.55 * size, s2: 0.1, bb: true, color: 0xffffff });
+    this.add('burst2', { x: x + dx * 0.15, y, z: z + dz * 0.15, life: 0.1, s0: 0.25 * size, s1: 0.7 * size, s2: 0.1, bb: true, color });
+    for (let i = 0; i < 4; i++) {
+      const sp = 6 + Math.random() * 6;
+      this.add('spark', {
+        x, y, z, vx: (dx + (Math.random() - 0.5) * 0.6) * sp, vy: (Math.random() - 0.3) * 3, vz: (dz + (Math.random() - 0.5) * 0.6) * sp,
+        drag: 8, life: 0.12, stretch: 0.5, color: i % 2 ? 0xffffff : color,
+      });
+    }
+    this.add('smoke', { x: x + dx * 0.3, y, z: z + dz * 0.3, vx: dx, vy: 1, vz: dz, drag: 2, life: 0.5, s0: 0.15, s1: 0.4 * size, s2: 0.05 });
+  }
+
+  puff(x, y, z, color = 0xd8d4e8, size = 0.4) {
+    this.add('smoke', {
+      x, y, z, vx: (Math.random() - 0.5) * 0.6, vy: 0.6, vz: (Math.random() - 0.5) * 0.6, drag: 2,
+      life: 0.6 + Math.random() * 0.3, s0: size * 0.5, s1: size, s2: size * 0.2, color,
+    });
   }
 
   confetti(x, y, z, n = 60) {

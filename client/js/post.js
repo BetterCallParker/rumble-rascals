@@ -186,13 +186,27 @@ export class ComicPost {
     this.uniforms.uDot.value = Math.max(4, Math.round(H / 170));
   }
 
-  render(scene, camera, time) {
+  // views: [{ camera, rect: {x,y,w,h} normalized (bottom-left origin) }]
+  render(scene, views, time) {
     const r = this.renderer;
+    const cam0 = views[0].camera;
     this.uniforms.uTime.value = time;
-    this.uniforms.cameraNear.value = camera.near;
-    this.uniforms.cameraFar.value = camera.far;
+    this.uniforms.cameraNear.value = cam0.near;
+    this.uniforms.cameraFar.value = cam0.far;
     r.getClearColor(this.clearColor);
     const clearAlpha = r.getClearAlpha();
+    const W = this.size.x, H = this.size.y;
+    const gutter = views.length > 1 ? Math.max(3, Math.round(H / 220)) : 0;
+    const rects = views.map((v) => {
+      const x = Math.round(v.rect.x * W), y = Math.round(v.rect.y * H);
+      const w = Math.round(v.rect.w * W), h = Math.round(v.rect.h * H);
+      return [x + gutter, y + gutter, Math.max(1, w - gutter * 2), Math.max(1, h - gutter * 2)];
+    });
+    const setRect = (rt, rc) => {
+      rt.viewport.set(rc[0], rc[1], rc[2], rc[3]);
+      rt.scissor.set(rc[0], rc[1], rc[2], rc[3]);
+      rt.scissorTest = true;
+    };
 
     // 1) normals + depth (outlined geometry only: layer 0)
     const bg = scene.background;
@@ -200,23 +214,40 @@ export class ComicPost {
     scene.background = null;
     scene.fog = null;
     scene.overrideMaterial = this.normalMat;
-    camera.layers.set(0);
     r.shadowMap.autoUpdate = false;
+    this.normalRT.scissorTest = false;
+    this.normalRT.viewport.set(0, 0, W, H);
     r.setRenderTarget(this.normalRT);
     r.setClearColor(0x000000, 0);
     r.clear();
-    r.render(scene, camera);
+    views.forEach((v, i) => {
+      v.camera.layers.set(0);
+      setRect(this.normalRT, rects[i]);
+      r.setRenderTarget(this.normalRT);
+      if (this.onView) this.onView(v.camera, i);
+      r.render(scene, v.camera);
+      v.camera.layers.enableAll();
+    });
     scene.overrideMaterial = null;
     scene.background = bg;
     scene.fog = fog;
-    camera.layers.enableAll();
 
     // 2) color
     r.shadowMap.needsUpdate = true;
-    r.setClearColor(this.clearColor, clearAlpha);
+    this.colorRT.scissorTest = false;
+    this.colorRT.viewport.set(0, 0, W, H);
     r.setRenderTarget(this.colorRT);
+    r.setClearColor(0x15101e, 1);
     r.clear();
-    r.render(scene, camera);
+    r.setClearColor(this.clearColor, clearAlpha);
+    views.forEach((v, i) => {
+      setRect(this.colorRT, rects[i]);
+      r.setRenderTarget(this.colorRT);
+      if (this.onView) this.onView(v.camera, i);
+      r.render(scene, v.camera);
+    });
+    this.colorRT.scissorTest = false;
+    this.normalRT.scissorTest = false;
 
     // 3) composite
     r.setRenderTarget(null);

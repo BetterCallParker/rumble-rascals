@@ -35,15 +35,27 @@ export const ST = {
   TAUNT: 11,
   STAGGER: 12,
   KO: 13, // knocked out cold: limp, can be dragged around
+  HANG: 14, // hanging off a ledge by the hands
+  SUPER: 15, // SPIN-O-RAMA super move
+  CLIMB: 16, // clinging to / climbing a wall
 };
 
 // States in which the player's own stick drives movement (and the client predicts).
-export const CONTROLLABLE = new Set([ST.FREE, ST.ATTACK, ST.CHARGE, ST.BLOCK, ST.TAUNT]);
+export const CONTROLLABLE = new Set([ST.FREE, ST.ATTACK, ST.CHARGE, ST.BLOCK, ST.TAUNT, ST.SUPER]);
 
 // Whether a player's movement is driven by deterministic stick input this tick.
-// Dropkicks are ballistic, so they're excluded.
+// Ballistic moves (dropkick, tackles, ground pound) are excluded.
+const BALLISTIC = new Set(['dk', 'spear', 'slide', 'pound']);
 export function isPredictable(state, actKind) {
-  return CONTROLLABLE.has(state) && actKind !== 'dk';
+  return CONTROLLABLE.has(state) && !BALLISTIC.has(actKind);
+}
+
+// Auto-sprint: keep the stick pinned while running on the ground and you break into a sprint.
+export const SPRINT = { TICKS: 34, MUL: 1.32 };
+export function updateSprint(p, stickLen, canSprint) {
+  if (canSprint && p.og && stickLen > 0.9) p.spT = Math.min(255, (p.spT | 0) + 1);
+  else if (!canSprint || stickLen < 0.55) p.spT = 0;
+  return p.spT > SPRINT.TICKS ? SPRINT.MUL : 1;
 }
 
 // Character body
@@ -73,27 +85,39 @@ export const STATE_MOVE_MUL = {
   [ST.CHARGE]: 0.45,
   [ST.BLOCK]: 0.35,
   [ST.TAUNT]: 0,
+  [ST.SUPER]: 0.75,
 };
-export const HOLD_HEAVY_MUL = 0.72;
+export const HOLD_HEAVY_MUL = 0.72; // default carry speed for heavy props (items can override)
 export const HOLD_PLAYER_MUL = 0.66; // lifting a player overhead (both hands)
 export const ONE_HAND_MUL = 0.75; // holding a conscious player by the collar
 export const DRAG_MUL = 0.8; // dragging a knocked-out player by one hand
 
 // Movement multiplier from what a player is carrying. Shared so prediction matches.
-export function holdMoveMul(grabMask, dragging, heavy) {
+// heavyMul: carry multiplier of a held heavy prop (1 when not carrying one).
+export function holdMoveMul(grabMask, dragging, heavyMul = 1) {
   if (grabMask === 3) return HOLD_PLAYER_MUL;
   if (grabMask) return dragging ? DRAG_MUL : ONE_HAND_MUL;
-  if (heavy) return HOLD_HEAVY_MUL;
-  return 1;
+  return heavyMul;
 }
 
 // Knockout tuning
 export const DAZE = {
-  PER_DMG: 3.6, // daze added per point of damage
-  DECAY_DELAY: 150, // ticks without being hit before daze recovers
-  DECAY: 0.22, // per tick
+  PER_DMG: 1.45, // daze added per point of damage (a KO takes a real beating: ~10+ solid hits)
+  DECAY_DELAY: 130, // ticks without being hit before daze recovers
+  DECAY: 0.28, // per tick
   KO_TICKS: 360, // how long a knockout lasts (mashing shortens it)
-  IMMUNE_TICKS: 150, // after waking up, daze can't build for a moment
+  IMMUNE_TICKS: 240, // after waking up, daze can't build for a while
+};
+
+// Blocking: hold block to raise a guard. Blocked hits drain the guard meter;
+// empty it and the guard SHATTERS (dizzy). Tap block right before a hit to PARRY.
+export const GUARD = {
+  MAX: 100,
+  DRAIN_PER_DMG: 4.2,
+  DRAIN_CHARGED: 2.4, // multiplier for charged / heavy attacks
+  REGEN: 0.5, // per tick
+  REGEN_DELAY: 45,
+  PARRY_TICKS: 8,
 };
 
 export const KILL_Y = -14;

@@ -1,13 +1,15 @@
 // Deterministic character movement + collision, shared by server and client prediction.
 import { MOVE, BTN, PLAYER_RADIUS, PLAYER_HEIGHT } from './constants.js';
 
-// p: { x,y,z, vx,vy,vz, og (on ground), co (coyote ticks), jb (jump buffer ticks), jh (jump held last tick) }
+// p: { x,y,z, vx,vy,vz, og (on ground), gnd (ground box index), co (coyote ticks),
+//      jb (jump buffer ticks), jh (jump held last tick) }
 // inp: { mx, mz, b }
-// opt: { mul (speed multiplier), canJump, dt }
+// opt: { mul (speed multiplier), canJump, dt, phys (level surface overrides) }
 // returns true if a jump was started this step
 export function stepMove(p, inp, boxes, opt) {
   const dt = opt.dt;
   const mul = opt.mul;
+  const phys = opt.phys || NO_PHYS;
   let mx = inp.mx || 0;
   let mz = inp.mz || 0;
   const len = Math.hypot(mx, mz);
@@ -15,10 +17,14 @@ export function stepMove(p, inp, boxes, opt) {
     mx /= len;
     mz /= len;
   }
-  const tx = mx * MOVE.SPEED * mul;
-  const tz = mz * MOVE.SPEED * mul;
+  // conveyor belts carry whoever stands on them
+  const [cvx, cvz] = beltVel(p, boxes);
+  const tx = mx * MOVE.SPEED * mul + cvx;
+  const tz = mz * MOVE.SPEED * mul + cvz;
   const hasInput = len > 0.08 && mul > 0;
-  const accel = p.og ? (hasInput ? MOVE.GROUND_ACCEL : MOVE.GROUND_DECEL) : MOVE.AIR_ACCEL;
+  const accel = p.og
+    ? hasInput ? phys.accel ?? MOVE.GROUND_ACCEL : phys.decel ?? MOVE.GROUND_DECEL
+    : phys.air ?? MOVE.AIR_ACCEL;
   approachVel(p, tx, tz, accel * dt);
 
   // Jumping with coyote time + input buffering
@@ -43,6 +49,35 @@ export function stepMove(p, inp, boxes, opt) {
   return jumped;
 }
 
+const NO_PHYS = {};
+
+export function beltVel(p, boxes) {
+  if (p.og && p.gnd >= 0) {
+    const b = boxes[p.gnd];
+    if (b && b.conv) return b.conv;
+  }
+  return ZERO2;
+}
+
+// Riders of moving platforms get carried along with them.
+function ride(o, boxes, dt) {
+  if (!o.og || o.gnd < 0) return;
+  const b = boxes[o.gnd];
+  if (b && b.carry) {
+    o.x += b.carry[0] * dt;
+    o.z += b.carry[1] * dt;
+  }
+}
+const ZERO2 = [0, 0];
+
+// Friction for bodies that aren't walking (knocked down, staggered...). Belts still carry them.
+export function groundFriction(p, boxes, friction) {
+  if (!p.og) return;
+  const [cvx, cvz] = beltVel(p, boxes);
+  p.vx = cvx + (p.vx - cvx) * friction;
+  p.vz = cvz + (p.vz - cvz) * friction;
+}
+
 function approachVel(p, tx, tz, maxDelta) {
   const dx = tx - p.vx;
   const dz = tz - p.vz;
@@ -58,8 +93,10 @@ function approachVel(p, tx, tz, maxDelta) {
 
 export function applyGravity(p, dt, jumpHeld = false) {
   let g = MOVE.GRAVITY;
-  if (p.vy < 0) g *= MOVE.FALL_GRAVITY_MUL;
-  else if (!jumpHeld) g *= MOVE.JUMP_CUT_GRAVITY_MUL;
+  if (p.vy < 0) {
+    g *= MOVE.FALL_GRAVITY_MUL;
+    p.bn = false;
+  } else if (!jumpHeld && !p.bn) g *= MOVE.JUMP_CUT_GRAVITY_MUL; // bounce pads keep full height
   p.vy -= g * dt;
   if (p.vy < -MOVE.MAX_FALL) p.vy = -MOVE.MAX_FALL;
 }
@@ -67,9 +104,11 @@ export function applyGravity(p, dt, jumpHeld = false) {
 // Moves a vertical cylinder (feet at p.y) through AABB world. Sets p.og.
 // Returns the impact speed against surfaces (useful for bounce/thud effects).
 export function collideMove(p, dt, boxes, R = PLAYER_RADIUS, H = PLAYER_HEIGHT) {
+  ride(p, boxes, dt);
   const wasGround = p.og;
   const prevY = p.y;
   p.og = false;
+  p.gnd = -1;
   let impact = 0;
 
   // --- vertical
@@ -81,8 +120,16 @@ export function collideMove(p, dt, boxes, R = PLAYER_RADIUS, H = PLAYER_HEIGHT) 
       if (p.vy <= 0 && prevY >= b.y1 - 0.25) {
         impact = Math.max(impact, -p.vy);
         p.y = b.y1;
+        if (b.bounce) {
+          // bounce pad: BOING!
+          p.vy = b.bounce;
+          p.bn = true;
+          p.bounced = true;
+          continue;
+        }
         p.vy = 0;
         p.og = true;
+        p.gnd = i;
       } else if (p.vy > 0 && prevY + H <= b.y0 + 0.3) {
         p.y = b.y0 - H;
         impact = Math.max(impact, p.vy);
@@ -108,6 +155,7 @@ export function collideMove(p, dt, boxes, R = PLAYER_RADIUS, H = PLAYER_HEIGHT) 
       if ((wasGround || p.og) && b.y1 - p.y <= MOVE.STEP_HEIGHT && p.vy <= 0.01) {
         p.y = b.y1;
         p.og = true;
+        p.gnd = i;
         continue;
       }
       let nx, nz, pen;
@@ -144,6 +192,7 @@ export function collideMove(p, dt, boxes, R = PLAYER_RADIUS, H = PLAYER_HEIGHT) 
         p.y = b.y1;
         p.vy = 0;
         p.og = true;
+        p.gnd = i;
         break;
       }
     }
@@ -161,7 +210,9 @@ export function circleRect(x, z, r, b) {
 
 // Sphere vs AABB world for props. Returns impact speed.
 export function collideSphere(o, dt, boxes, r, restitution = 0.35, friction = 0.85) {
+  ride(o, boxes, dt);
   o.og = false;
+  o.gnd = -1;
   o.x += o.vx * dt;
   o.y += o.vy * dt;
   o.z += o.vz * dt;
@@ -193,10 +244,15 @@ export function collideSphere(o, dt, boxes, r, restitution = 0.35, friction = 0.
         o.vx -= (1 + restitution) * vn * nx;
         o.vy -= (1 + restitution) * vn * ny;
         o.vz -= (1 + restitution) * vn * nz;
-        if (ny > 0.6) {
+        if (ny > 0.6 && b.bounce) {
+          o.vy = b.bounce * 0.85;
+        } else if (ny > 0.6) {
           o.og = true;
-          o.vx *= friction;
-          o.vz *= friction;
+          o.gnd = i;
+          const c = b.conv;
+          const cvx = c ? c[0] : 0, cvz = c ? c[1] : 0;
+          o.vx = cvx + (o.vx - cvx) * friction;
+          o.vz = cvz + (o.vz - cvz) * friction;
           if (Math.abs(o.vy) < 1.2) o.vy = 0;
         }
       }

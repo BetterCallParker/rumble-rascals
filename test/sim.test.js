@@ -73,7 +73,7 @@ test('releasing the trigger lets go of a conscious rascal', () => {
 
 test('the dummy pops back after a ring-out', () => {
   const { g, dummy } = setup();
-  dummy.y = -30;
+  dummy.y = -100;
   g.step();
   assert.equal(dummy.state, ST.DEAD);
   for (let i = 0; i < 120; i++) g.step();

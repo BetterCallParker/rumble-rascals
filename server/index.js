@@ -89,6 +89,7 @@ wss.on('connection', (ws) => {
         const r = getRoom(code);
         client.room = r;
         r.clients.add(client);
+        updateHost(r);
         send(ws, { t: 'welcome', cid: client.id, room: code, tickRate: TICK_RATE, maxPlayers: MAX_PLAYERS });
         send(ws, r.game.roster());
         break;
@@ -111,10 +112,28 @@ wss.on('connection', (ws) => {
         if (!room || !Array.isArray(msg.d)) return;
         for (const row of msg.d) {
           if (!Array.isArray(row) || !client.players.has(row[0])) continue;
-          room.game.pushInput(row[0], row[1], row[2], row[3], row[4]);
+          room.game.pushInput(row[0], row[1], row[2], row[3], row[4], row[5]);
         }
         break;
       }
+      case 'ready':
+        if (room) room.game.readyMsg(client.id, msg.id);
+        break;
+      case 'char':
+        if (room) room.game.setCharacter(client.id, msg.id, msg.c);
+        break;
+      case 'set':
+        if (room) room.game.setSetting(client.id, String(msg.key), msg.val);
+        break;
+      case 'cos':
+        if (room) room.game.setCosmetics(client.id, msg.id, msg.hat, msg.face);
+        break;
+      case 'color':
+        if (room) room.game.cycleColor(client.id, msg.id);
+        break;
+      case 'level':
+        if (room) room.game.requestLevel(client.id, msg.dir);
+        break;
       case 'ping':
         send(ws, { t: 'pong', c: msg.c, tick: room ? room.game.tick : 0 });
         break;
@@ -125,10 +144,21 @@ wss.on('connection', (ws) => {
     if (client.room) {
       client.room.game.removeClient(client.id);
       client.room.clients.delete(client);
+      updateHost(client.room);
     }
   });
   ws.on('error', () => {});
 });
+
+// The first player in the room is the host and controls the match settings.
+function updateHost(room) {
+  const first = room.clients.values().next().value;
+  const host = first ? first.id : null;
+  if (room.game.hostClient !== host) {
+    room.game.hostClient = host;
+    room.game.rosterDirty = true;
+  }
+}
 
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));

@@ -1,6 +1,10 @@
-// DOM-based comic HUD: player cards, POW! bursts, announcer, name tags, lobby & help panels.
+// DOM-based comic HUD: per-viewport name tags & POW! bursts, player cards, announcer,
+// race progress bar, help panel.
 import * as THREE from 'three';
-import { COLORS, ST, PHASE, ROUND_WINS_TO_MATCH, MAX_PLAYERS } from '/shared/constants.js';
+import { COLORS, ST, PHASE } from '/shared/constants.js';
+import { CHARACTERS } from '/shared/characters.js';
+import { ITEMS } from '/shared/items.js';
+import { LEVELS } from '/shared/levels.js';
 
 const $ = (id) => document.getElementById(id);
 const hex = (n) => '#' + n.toString(16).padStart(6, '0');
@@ -32,22 +36,53 @@ function burstPoints(n = 14) {
   return pts.join(' ');
 }
 
+function makeWordEl(text, opts) {
+  const size = opts.size || 46;
+  const [fill, bg] = opts.colors;
+  const w = el('div', 'pow' + (opts.plain ? ' plain' : ''));
+  const inner = el('div', 'inner');
+  inner.style.setProperty('--s', size + 'px');
+  inner.style.setProperty('--r', opts.rot + 'deg');
+  inner.style.setProperty('--c', fill);
+  inner.style.setProperty('--dur', (opts.dur || 0.9) + 's');
+  if (!opts.plain) {
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', '-110 -85 220 170');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    const shadow = document.createElementNS(svgNS, 'polygon');
+    shadow.setAttribute('points', opts.pts);
+    shadow.setAttribute('fill', '#15101e');
+    shadow.setAttribute('transform', 'translate(8 8)');
+    const poly = document.createElementNS(svgNS, 'polygon');
+    poly.setAttribute('points', opts.pts);
+    poly.setAttribute('fill', bg);
+    poly.setAttribute('stroke', '#15101e');
+    poly.setAttribute('stroke-width', '7');
+    poly.setAttribute('stroke-linejoin', 'round');
+    svg.append(shadow, poly);
+    inner.appendChild(svg);
+  }
+  inner.appendChild(el('span', '', text));
+  w.appendChild(inner);
+  return w;
+}
+
 export class Hud {
   constructor() {
-    this.fx = $('fx');
-    this.labels = $('labels');
+    this.views = $('views');
     this.cards = $('cards');
     this.announceEl = $('announce');
     this.phaseEl = $('phase');
-    this.lobbyEl = $('lobby');
     this.joinbar = $('joinbar');
     this.netEl = $('net');
     this.roomEl = $('roomtag');
     this.helpEl = $('help');
     this.flashEl = $('flash');
+    this.raceEl = $('race');
     this.words = [];
+    this.vps = []; // per viewport { box, labels, fx, tags: Map, caption }
     this.cardEls = new Map();
-    this.tagEls = new Map();
     this.lastDamage = new Map();
     this.flashV = 0;
     this.buildHelp();
@@ -59,62 +94,58 @@ export class Hud {
 
   setRoom(code) {
     this.roomEl.replaceChildren(el('span', '', 'ROOM '), el('b', '', code));
-    this.roomEl.title = 'Share this link so friends can join';
   }
 
-  // ---------------------------------------------------------------- POW! words
+  // ---------------------------------------------------------------- viewports
+  layout(rects, captions) {
+    const key = JSON.stringify(rects) + captions.join(',');
+    if (this._layoutKey === key) return;
+    this._layoutKey = key;
+    for (const vp of this.vps) vp.box.remove();
+    this.vps = rects.map((r, i) => {
+      const box = el('div', 'vp');
+      box.style.left = r.x * 100 + '%';
+      box.style.width = r.w * 100 + '%';
+      box.style.top = (1 - r.y - r.h) * 100 + '%';
+      box.style.height = r.h * 100 + '%';
+      const labels = el('div', 'vp-labels');
+      const fx = el('div', 'vp-fx');
+      box.append(labels, fx);
+      let caption = null;
+      if (captions[i]) {
+        caption = el('div', 'vp-caption', captions[i]);
+        box.appendChild(caption);
+      }
+      this.views.appendChild(box);
+      return { box, labels, fx, tags: new Map(), caption, w: 1, h: 1 };
+    });
+    for (const w of this.words) w.els = [];
+  }
+
+  // ---------------------------------------------------------------- POW words
   word(text, world, opts = {}) {
     if (!text) return;
-    const size = opts.size || 46;
-    const [fill, bg] = opts.colors || BURST_COLORS[(Math.random() * BURST_COLORS.length) | 0];
-    const w = el('div', 'pow' + (opts.plain ? ' plain' : ''));
-    const inner = el('div', 'inner');
-    inner.style.setProperty('--s', size + 'px');
-    inner.style.setProperty('--r', (opts.rot ?? (Math.random() * 30 - 15)) + 'deg');
-    inner.style.setProperty('--c', fill);
-    inner.style.setProperty('--dur', (opts.dur || 0.9) + 's');
-    if (!opts.plain) {
-      const svgNS = 'http://www.w3.org/2000/svg';
-      const svg = document.createElementNS(svgNS, 'svg');
-      svg.setAttribute('viewBox', '-110 -85 220 170');
-      svg.setAttribute('preserveAspectRatio', 'none');
-      const shadow = document.createElementNS(svgNS, 'polygon');
-      const pts = burstPoints(opts.spikes || 12);
-      shadow.setAttribute('points', pts);
-      shadow.setAttribute('fill', '#15101e');
-      shadow.setAttribute('transform', 'translate(8 8)');
-      const poly = document.createElementNS(svgNS, 'polygon');
-      poly.setAttribute('points', pts);
-      poly.setAttribute('fill', bg);
-      poly.setAttribute('stroke', '#15101e');
-      poly.setAttribute('stroke-width', '7');
-      poly.setAttribute('stroke-linejoin', 'round');
-      svg.append(shadow, poly);
-      inner.appendChild(svg);
-    }
-    inner.appendChild(el('span', '', text));
-    w.appendChild(inner);
-    this.fx.appendChild(w);
-    const item = {
-      el: w,
-      world: world ? world.clone() : null,
-      sx: opts.sx, sy: opts.sy,
-      ox: (Math.random() - 0.5) * 40 + (opts.ox || 0),
-      oy: -30 - Math.random() * 30 + (opts.oy || 0),
-      t: 0,
-      max: (opts.dur || 0.9) + 0.05,
+    const o = {
+      size: opts.size || 46,
+      colors: opts.colors || BURST_COLORS[(Math.random() * BURST_COLORS.length) | 0],
+      rot: opts.rot ?? Math.random() * 30 - 15,
+      dur: opts.dur || 0.9,
+      plain: !!opts.plain,
+      pts: burstPoints(opts.spikes || 12),
     };
-    this.words.push(item);
-    if (this.words.length > 26) this.removeWord(0);
+    this.words.push({
+      text, opts: o, world: world ? world.clone() : null, sx: opts.sx, sy: opts.sy, screen: !world,
+      ox: (Math.random() - 0.5) * 40 + (opts.ox || 0), oy: -30 - Math.random() * 30 + (opts.oy || 0),
+      t: 0, max: o.dur + 0.05, els: [], only: opts.only ?? -1,
+    });
+    if (this.words.length > 30) this.removeWord(0);
   }
 
   removeWord(i) {
-    const w = this.words[i];
-    w.el.remove();
+    for (const e of this.words[i].els) if (e) e.remove();
     this.words.splice(i, 1);
   }
 
-  // ---------------------------------------------------------------- announcer
   announce(text, sub, style) {
     this.announceEl.querySelectorAll('.ann').forEach((n) => {
       n.classList.add('out');
@@ -123,7 +154,7 @@ export class Hud {
     const a = el('div', 'ann ' + (style || 'big'), text);
     if (sub) a.appendChild(el('span', 'sub', sub));
     this.announceEl.appendChild(a);
-    const life = style === 'count' ? 800 : style === 'small' ? 2600 : style === 'champ' ? 5200 : 2000;
+    const life = style === 'count' ? 800 : style === 'small' ? 2600 : style === 'champ' ? 5200 : style === 'level' ? 2600 : 2000;
     setTimeout(() => {
       a.classList.add('out');
       setTimeout(() => a.remove(), 400);
@@ -135,8 +166,13 @@ export class Hud {
   }
 
   // ---------------------------------------------------------------- per-frame
-  update(dt, camera, width, height, ctx) {
-    // words
+  // views: [{ camera, rect }], ctx: { views(rascals), states, roster, localSlots }
+  update(dt, views, W, H, ctx) {
+    for (let vi = 0; vi < this.vps.length; vi++) {
+      const r = views[vi] ? views[vi].rect : { w: 1, h: 1 };
+      this.vps[vi].w = r.w * W;
+      this.vps[vi].h = r.h * H;
+    }
     for (let i = this.words.length - 1; i >= 0; i--) {
       const w = this.words[i];
       w.t += dt;
@@ -144,32 +180,57 @@ export class Hud {
         this.removeWord(i);
         continue;
       }
-      let x = w.sx, y = w.sy;
-      if (w.world) {
-        _v.copy(w.world).project(camera);
-        x = (_v.x * 0.5 + 0.5) * width;
-        y = (-_v.y * 0.5 + 0.5) * height;
+      for (let vi = 0; vi < this.vps.length; vi++) {
+        const vp = this.vps[vi];
+        if (w.only >= 0 && w.only !== vi) continue;
+        let x, y;
+        if (w.screen) {
+          if (vi > 0) continue;
+          x = w.sx;
+          y = w.sy;
+        } else {
+          if (!views[vi]) continue;
+          _v.copy(w.world).project(views[vi].camera);
+          if (_v.z > 1 || Math.abs(_v.x) > 1.3 || Math.abs(_v.y) > 1.3) {
+            if (w.els[vi]) w.els[vi].style.display = 'none';
+            continue;
+          }
+          x = (_v.x * 0.5 + 0.5) * vp.w;
+          y = (-_v.y * 0.5 + 0.5) * vp.h;
+        }
+        let e = w.els[vi];
+        if (!e) {
+          const o = { ...w.opts, size: Math.round(w.opts.size * Math.min(1, Math.sqrt(vp.h / 700) + 0.15)) };
+          e = w.els[vi] = makeWordEl(w.text, o);
+          (w.screen ? this.views : vp.fx).appendChild(e);
+        }
+        e.style.display = '';
+        const cx = Math.min(vp.w - 50, Math.max(50, x + w.ox));
+        const cy = Math.min(vp.h - 50, Math.max(50, y + w.oy));
+        e.style.transform = `translate(${cx.toFixed(1)}px, ${cy.toFixed(1)}px)`;
       }
-      x = Math.min(width - 60, Math.max(60, x + w.ox));
-      y = Math.min(height - 60, Math.max(60, y + w.oy));
-      w.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
     }
-    // white flash
     if (this.flashV > 0) {
       this.flashV = Math.max(0, this.flashV - dt * 6);
       this.flashEl.style.opacity = this.flashV.toFixed(3);
     }
-    this.updateTags(camera, width, height, ctx);
+    for (let vi = 0; vi < this.vps.length; vi++) if (views[vi]) this.updateTags(vi, views[vi].camera, ctx);
   }
 
-  updateTags(camera, width, height, ctx) {
+  updateTags(vi, camera, ctx) {
+    const vp = this.vps[vi];
     const seen = new Set();
     for (const [id, view] of ctx.views) {
       const s = ctx.states.get(id);
       const r = ctx.roster.get(id);
       if (!s || !r || s.s === ST.DEAD) continue;
+      view.headWorld(_v);
+      _v.y += 0.85;
+      const dist = _v.distanceTo(camera.position);
+      _v.project(camera);
+      if (_v.z > 1 || dist > 45) continue;
       seen.add(id);
-      let tag = this.tagEls.get(id);
+      let tag = vp.tags.get(id);
       if (!tag) {
         tag = el('div', 'nametag');
         tag._name = el('span', 'nm');
@@ -178,10 +239,13 @@ export class Hud {
         tag._bar = el('span', 'kobar');
         tag._barFill = el('i');
         tag._bar.appendChild(tag._barFill);
+        tag._stam = el('span', 'stambar');
+        tag._stamFill = el('i');
+        tag._stam.appendChild(tag._stamFill);
         tag._arrow = el('span', 'arrow');
-        tag.append(tag._zz, tag._bar, tag._pn, tag._name, tag._arrow);
-        this.labels.appendChild(tag);
-        this.tagEls.set(id, tag);
+        tag.append(tag._zz, tag._bar, tag._stam, tag._pn, tag._name, tag._arrow);
+        vp.labels.appendChild(tag);
+        vp.tags.set(id, tag);
       }
       const local = ctx.localSlots.get(id);
       const pc = r.dummy ? '#9c7442' : hex(COLORS[r.color % COLORS.length].body);
@@ -197,52 +261,72 @@ export class Hud {
       tag._zz.style.display = ko ? '' : 'none';
       tag._bar.style.display = ko ? '' : 'none';
       if (ko) tag._barFill.style.width = Math.max(0, Math.min(100, (s.ko / 360) * 100)).toFixed(0) + '%';
-      view.headWorld(_v);
-      _v.y += 0.85;
-      _v.project(camera);
-      const x = (_v.x * 0.5 + 0.5) * width, y = (-_v.y * 0.5 + 0.5) * height;
-      tag.style.display = _v.z < 1 ? '' : 'none';
-      tag.style.transform = `translate(-50%, -100%) translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+      const climbing = s.s === ST.HANG || s.s === ST.CLIMB;
+      tag._stam.style.display = climbing ? '' : 'none';
+      if (climbing) {
+        tag._stamFill.style.width = (s.sm ?? 100) + '%';
+        tag._stam.classList.toggle('low', (s.sm ?? 100) < 30);
+      }
+      const x = (_v.x * 0.5 + 0.5) * vp.w, y = (-_v.y * 0.5 + 0.5) * vp.h;
+      tag.style.display = '';
+      const sc = Math.max(0.6, Math.min(1.15, 14 / Math.max(4, dist)));
+      tag.style.transform = `translate(-50%, -100%) translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) scale(${sc.toFixed(2)})`;
     }
-    for (const [id, tag] of this.tagEls) {
+    for (const [id, tag] of vp.tags) {
       if (!seen.has(id)) {
         tag.style.display = 'none';
         if (!ctx.roster.has(id)) {
           tag.remove();
-          this.tagEls.delete(id);
+          vp.tags.delete(id);
         }
       }
     }
   }
 
   // ---------------------------------------------------------------- player cards
-  updateCards(roster, states, localSlots, phase) {
+  updateCards(roster, states, localSlots, snap) {
+    const phase = snap ? snap.ph : PHASE.LOBBY;
     const humans = [...roster.values()].filter((r) => !r.dummy);
     const seen = new Set();
+    const props = snap ? new Map(snap.props.map((p) => [p.id, p])) : new Map();
+    this.cards.classList.toggle('hidden', phase === PHASE.LOBBY && !snap?.practice);
     humans.forEach((r, i) => {
       seen.add(r.id);
       let c = this.cardEls.get(r.id);
       if (!c) {
         c = el('div', 'card');
         c._face = el('div', 'face');
+        c._img = el('img');
+        c._face.appendChild(c._img);
         c._name = el('div', 'name');
         c._dmg = el('div', 'dmg');
-        c._daze = el('div', 'daze');
+        c._bars = el('div', 'bars');
+        c._daze = el('div', 'meter daze');
         c._dazeFill = el('i');
         c._daze.appendChild(c._dazeFill);
+        c._guard = el('div', 'meter guard');
+        c._guardFill = el('i');
+        c._guard.appendChild(c._guardFill);
+        c._super = el('div', 'meter super');
+        c._superFill = el('i');
+        c._super.appendChild(c._superFill);
+        c._bars.append(c._daze, c._guard, c._super);
         c._meta = el('div', 'meta');
         c._stars = el('span', 'stars');
         c._kos = el('span', 'kos');
         c._meta.append(c._stars, c._kos);
-        c._ready = el('div', 'ready', 'READY!');
+        c._item = el('div', 'item');
         c._zz = el('div', 'kozz', 'K.O. Zzz');
-        c.append(c._face, c._name, c._dmg, c._daze, c._meta, c._ready, c._zz);
+        c._sup = el('div', 'supready', 'SUPER READY!');
+        c.append(c._face, c._name, c._dmg, c._bars, c._meta, c._item, c._zz, c._sup);
         c.style.setProperty('--rot', (i % 2 ? 1.5 : -1.5) + 'deg');
         this.cards.appendChild(c);
         this.cardEls.set(r.id, c);
       }
       const col = COLORS[r.color % COLORS.length];
       c.style.setProperty('--pc', hex(col.body));
+      const portrait = this.portraits && this.portraits[(r.char || 0) + ':' + (r.color % COLORS.length)];
+      if (portrait && c._img.src !== portrait) c._img.src = portrait;
       const local = localSlots.get(r.id);
       c.classList.toggle('local', !!local);
       const nameKey = (local ? local.label + '|' : '') + r.name;
@@ -269,17 +353,31 @@ export class Hud {
         }
         this.lastDamage.set(r.id, dmg);
         const heat = Math.min(1, dmg / 150);
-        const cc = heat < 0.33 ? '#ffffff' : heat < 0.66 ? '#ffd21f' : heat < 0.9 ? '#ff8a00' : '#ef2f2a';
-        c._dmg.style.setProperty('--dc', cc);
+        c._dmg.style.setProperty('--dc', heat < 0.33 ? '#ffffff' : heat < 0.66 ? '#ffd21f' : heat < 0.9 ? '#ff8a00' : '#ef2f2a');
       }
-      const dz = s ? s.dz : 0;
-      c._dazeFill.style.width = (s && s.ko > 0 ? 100 : dz) + '%';
-      c._daze.classList.toggle('full', dz > 80 || (s && s.ko > 0));
-      const stars = '★'.repeat(Math.min(r.wins, ROUND_WINS_TO_MATCH)) + '☆'.repeat(Math.max(0, ROUND_WINS_TO_MATCH - r.wins));
+      c._dazeFill.style.width = (s && s.ko > 0 ? 100 : s ? s.dz : 0) + '%';
+      c._daze.classList.toggle('full', !!s && (s.dz > 80 || s.ko > 0));
+      c._guardFill.style.width = (s ? s.gd : 100) + '%';
+      c._guard.classList.toggle('low', !!s && s.gd < 30);
+      const su = s ? s.su || 0 : 0;
+      c._superFill.style.width = su + '%';
+      c._super.classList.toggle('full', su >= 100);
+      c._sup.style.display = su >= 100 && !dead ? '' : 'none';
+      const toWin = this.roundsToWin || 3;
+      const stars = '★'.repeat(Math.min(r.wins, toWin)) + '☆'.repeat(Math.max(0, toWin - r.wins));
       if (c._stars.textContent !== stars) c._stars.textContent = stars;
       const kos = `KOs ${r.kos}`;
       if (c._kos.textContent !== kos) c._kos.textContent = kos;
-      c._ready.style.display = phase === PHASE.LOBBY && r.ready ? '' : 'none';
+      // held item / ammo
+      let itemText = CHARACTERS[r.char || 0].name;
+      if (s && s.h >= 0) {
+        const pr = props.get(s.h);
+        if (pr) {
+          const def = ITEMS[pr.k];
+          itemText = def.label + (pr.am !== undefined ? ` x${pr.am}` : '');
+        }
+      }
+      if (c._item.textContent !== itemText) c._item.textContent = itemText;
       c._zz.style.display = s && s.ko > 0 ? '' : 'none';
     });
     for (const [id, c] of this.cardEls) {
@@ -290,33 +388,31 @@ export class Hud {
     }
   }
 
-  // ---------------------------------------------------------------- top bar / lobby / join prompts
+  // ---------------------------------------------------------------- top bar / race bar / join prompts
   updatePhase(snap, roster) {
     if (!snap) return;
-    const humans = [...roster.values()].filter((r) => !r.dummy);
     let main = '', sub = '';
+    const lv = LEVELS[snap.lv] || LEVELS[0];
     this.phaseEl.classList.toggle('sudden', !!snap.sd && snap.ph === PHASE.FIGHT);
     switch (snap.ph) {
-      case PHASE.LOBBY: {
-        const ready = humans.filter((r) => r.ready).length;
-        main = 'PRACTICE BRAWL';
-        sub = humans.length < 2 ? 'Waiting for rascals - pound the test dummy!' : `${ready}/${humans.length} ready - press START / ENTER`;
+      case PHASE.LOBBY:
+        main = 'PRACTICE';
+        sub = lv.name;
         break;
-      }
       case PHASE.COUNTDOWN:
         main = `ROUND ${snap.rd}`;
-        sub = 'Get ready...';
+        sub = lv.name;
         break;
       case PHASE.FIGHT: {
         const secs = Math.floor(snap.pt / 60);
         const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, '0');
         main = snap.sd ? 'SUDDEN DEATH!' : `ROUND ${snap.rd}`;
-        sub = `${mm}:${ss}  -  last rascal standing wins`;
+        sub = lv.mode === 'race' ? `${mm}:${ss}  -  RUN!` : `${mm}:${ss}  -  ${lv.name}`;
         break;
       }
       case PHASE.ROUND_END:
         main = 'ROUND OVER!';
-        sub = `First to ${ROUND_WINS_TO_MATCH} wins the match`;
+        sub = `First to ${this.roundsToWin || 3} wins`;
         break;
       case PHASE.MATCH_END:
         main = 'MATCH OVER!';
@@ -328,26 +424,38 @@ export class Hud {
       this._phaseKey = key;
       this.phaseEl.replaceChildren(document.createTextNode(main), el('span', 'sub', sub));
     }
-    // lobby roster panel
-    const inLobby = snap.ph === PHASE.LOBBY;
-    this.lobbyEl.classList.toggle('hidden', !inLobby);
-    if (inLobby) {
-      const lk = humans.map((r) => r.id + r.name + r.ready).join(',');
-      if (this._lobbyKey !== lk) {
-        this._lobbyKey = lk;
-        const kids = [el('h2', '', 'THE LOBBY')];
-        for (const r of humans) {
-          const row = el('div', 'row');
-          const left = el('span');
-          const dot = el('span', 'dot');
-          dot.style.background = hex(COLORS[r.color % COLORS.length].body);
-          left.append(dot, document.createTextNode(r.name));
-          row.append(left, el('span', r.ready ? 'ok' : 'wait', r.ready ? 'READY!' : 'not ready'));
-          kids.push(row);
-        }
-        kids.push(el('p', '', `${humans.length}/${MAX_PLAYERS} rascals. Need 2+ to start a match. Everyone presses START (Menu) / ENTER to ready up. Press H or VIEW for controls.`));
-        this.lobbyEl.replaceChildren(...kids);
+    // race progress bar
+    const race = lv.mode === 'race';
+    this.raceEl.classList.toggle('hidden', !race);
+    if (race) {
+      const x0 = -10, x1 = lv.finishX;
+      const pct = (x) => Math.max(0, Math.min(100, ((x - x0) / (x1 - x0)) * 100));
+      if (!this._raceDots) this._raceDots = new Map();
+      if (!this._raceChaser) {
+        this.raceEl.replaceChildren(el('div', 'race-track'), el('div', 'race-flag', '🏁'));
+        this._raceChaser = el('div', 'race-chaser', 'ROLLER');
+        this.raceEl.appendChild(this._raceChaser);
+        this._raceDots.clear();
       }
+      this._raceChaser.style.left = pct(snap.cx ?? lv.chaser.startX) + '%';
+      const seen = new Set();
+      for (const p of snap.players) {
+        const r = roster.get(p.id);
+        if (!r || r.dummy || p.s === ST.DEAD) continue;
+        seen.add(p.id);
+        let d = this._raceDots.get(p.id);
+        if (!d) {
+          d = el('div', 'race-dot');
+          this.raceEl.appendChild(d);
+          this._raceDots.set(p.id, d);
+        }
+        d.style.left = pct(p.x) + '%';
+        d.style.background = hex(COLORS[r.color % COLORS.length].body);
+      }
+      for (const [id, d] of this._raceDots) if (!seen.has(id)) { d.remove(); this._raceDots.delete(id); }
+    } else if (this._raceChaser) {
+      this._raceChaser = null;
+      this.raceEl.replaceChildren();
     }
   }
 
@@ -389,40 +497,43 @@ export class Hud {
       return t;
     };
     const pad = [
-      ['Left Stick', 'Move'],
-      ['A', 'Jump'],
-      ['X', 'Punch / swing weapon (hold = charge!)'],
-      ['Y', 'Kick (in the air = DROPKICK)'],
-      ['LT', 'Left hand grab (hold)'],
-      ['RT', 'Right hand grab (hold)'],
-      ['LT + RT', 'Lift a rascal over your head'],
-      ['X while holding', 'Pummel / throw / fling'],
-      ['B', 'Dodge roll'],
-      ['RB', 'Block (tap right before a hit = PARRY)'],
-      ['LB', 'Taunt'],
-      ['Menu', 'Ready up'],
-      ['View', 'Show this help'],
+      ['Left Stick', 'Move (keep running to SPRINT)'],
+      ['Right Stick', 'Turn your camera'],
+      ['D-Pad up / down', 'Zoom camera in / out'],
+      ['A', 'Jump  ·  climb up a ledge'],
+      ['X', 'Punch / swing / shoot (hold = charge)'],
+      ['Y', 'Kick  ·  air: DROPKICK  ·  sprint: SLIDE'],
+      ['Sprint + X', 'SPEAR TACKLE'],
+      ['LT / RT', 'Left / right hand grab (hold)'],
+      ['LT + RT', 'Lift a rascal overhead'],
+      ['Hold LT/RT on a wall', 'Cling & climb back up'],
+      ['B', 'Dodge roll (puts out fire!)'],
+      ['RB', 'Block  ·  air: GROUND POUND'],
+      ['LB', 'Taunt  ·  SUPER when meter is full'],
+      ['View', 'Help / lobby settings (host)'],
     ];
     const kb = [
-      ['WASD / Arrows', 'Move'],
+      ['WASD', 'Move'],
+      ['Mouse / Arrows', 'Turn camera (click to lock mouse)'],
+      ['Wheel  - / =', 'Zoom camera'],
       ['Space', 'Jump'],
-      ['J', 'Punch / swing (hold = charge)'],
-      ['K', 'Kick / dropkick'],
-      ['Q / Left Mouse', 'Left hand grab'],
-      ['E / Right Mouse', 'Right hand grab'],
-      ['L', 'Block / parry'],
+      ['J', 'Punch / swing / shoot'],
+      ['K', 'Kick'],
+      ['Q / E or mouse L / R', 'Left / right hand grab'],
+      ['L', 'Block  ·  air: ground pound'],
       ['Shift', 'Dodge roll'],
-      ['T', 'Taunt'],
-      ['Enter', 'Join / ready up'],
-      ['H', 'Show this help'],
+      ['T', 'Taunt / SUPER'],
+      ['Enter', 'Join / ready'],
+      ['M', 'Music on / off'],
+      ['H', 'This help'],
     ];
     const c1 = el('div');
     c1.append(el('h3', '', 'XBOX CONTROLLER'), rows(pad));
     const c2 = el('div');
-    c2.append(el('h3', '', 'KEYBOARD'), rows(kb));
+    c2.append(el('h3', '', 'KEYBOARD + MOUSE'), rows(kb));
     const cols = el('div', 'cols');
     cols.append(c1, c2);
-    const tip = el('div', 'tip', 'HOW TO WIN: Punch rascals until they get DIZZY and KNOCKED OUT (watch the daze bar). Grab a knocked-out rascal with one trigger to DRAG them, squeeze both triggers to LIFT them overhead, then press X to chuck them off the roof! Smash barrels for big booms and dodge the wrecking ball.');
+    const tip = el('div', 'tip', 'HOW TO WIN: Pound rascals until their daze bar fills and they get KNOCKED OUT. Grab them with one trigger to DRAG them, squeeze both to LIFT, then press X to chuck them off the stage! Knocked off? Hold a trigger against the wall to climb back. Block drains your guard meter (tap block right before a hit to PARRY). Fill your SUPER meter and press LB for SPIN-O-RAMA!');
     this.helpEl.replaceChildren(el('h2', '', 'HOW TO RUMBLE'), cols, tip);
   }
 }
